@@ -4,6 +4,7 @@ Streamlit + agentes modulares (papéis no estilo CrewAI) + busca web (ddgs) + Re
 
 Secrets (Streamlit Cloud > Settings > Secrets):
     LLM_API_KEY  = "sua-chave-gemini"
+    SERPER_API_KEY = "sua-chave-serper"   # recomendado: preços reais do Google Shopping (serper.dev)
     LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"   # opcional
     LLM_MODEL    = "gemini-3.8-flash"                                           # opcional
     LLM_FALLBACK_MODEL = "gemini-3.5-flash-lite"                                 # opcional
@@ -51,8 +52,11 @@ except ImportError:  # pragma: no cover
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+PROPOSTA_V = 3                # muda quando o formato dos dados muda (descarta resultados antigos da sessão)
 MAX_ITENS = 6                 # itens por edital (cada item gera buscas e downloads de páginas)
 MAX_PAGINAS_POR_ITEM = 6      # páginas de loja consultadas por item
+MAX_OFERTAS_SHOPPING = 12
+STRUCT_ORIGINS = ("página do produto", "Google Shopping (Serper)")
 NAVY = colors.HexColor("#1F3A5F")
 LIGHT = colors.HexColor("#EEF2F7")
 HEADERS = {
@@ -144,9 +148,44 @@ def search_web(query: str, n: int = 8) -> list[dict]:
         try:
             return list(DDGS().text(query, region="br-pt", safesearch="off", max_results=n))
         except Exception as e:  # limite de requisições, timeout etc.
+            if "no results" in str(e).lower():  # consulta sem resultados: não é erro nem limite
+                return []
             last = e
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"Falha na busca web (possível limite de requisições): {last}")
+
+
+def _known_store(name: str) -> bool:
+    norm = re.sub(r"[^a-z0-9.]", "", name.lower())
+    return any(s in norm for s in KNOWN_STORES)
+
+
+def serper_shopping(query: str, api_key: str, n: int = 10) -> list[dict]:
+    """Google Shopping via Serper (serper.dev): devolve loja, preço e avaliação já estruturados."""
+    r = requests.post(
+        "https://google.serper.dev/shopping",
+        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+        json={"q": query, "gl": "br", "hl": "pt-br", "num": n},
+        timeout=20,
+    )
+    if r.status_code in (401, 403):
+        raise RuntimeError(f"Serper recusou a chave (HTTP {r.status_code}): confira a chave e os créditos.")
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("shopping", []):
+        raw = it.get("price")
+        m = _PRICE_RE.search(str(raw)) if raw is not None else None
+        preco = to_float(m.group(1)) if m else to_float(raw)
+        if not (1 <= preco <= 5_000_000):
+            continue
+        loja = str(it.get("source") or host_of(it.get("link") or ""))
+        out.append({
+            "titulo": str(it.get("title") or "")[:160], "url": it.get("link") or "", "loja": loja,
+            "loja_conhecida": _known_store(loja), "preco": preco, "origem": "Google Shopping (Serper)",
+            "nota": to_float(it.get("rating"), 0.0) or None, "n_avaliacoes": int(to_float(it.get("ratingCount"), 0)) or None,
+            "motivo_sem_preco": "",
+        })
+    return out
 
 
 def is_public_url(url: str) -> bool:
@@ -303,7 +342,7 @@ def _is_blocked(host: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
 
 
-def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_step=lambda m: None):
+def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_step=lambda m: None, serper_key: str = ""):
     """Busca cada item na web, abre as páginas e devolve (ofertas com preço, páginas sem preço, log das buscas)."""
     cands = {i: [] for i in queries_by_item}
     sem_preco = {i: [] for i in queries_by_item}
@@ -311,6 +350,8 @@ def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_
     seen = {i: set() for i in queries_by_item}
 
     def run_phase(qs_by_item: dict[int, list[str]]) -> None:
+        if not qs_by_item:
+            return
         found: dict[int, list[dict]] = {}
         for i, qs in qs_by_item.items():
             found[i] = []
@@ -344,7 +385,25 @@ def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_
                 else:
                     sem_preco[i].append(c)
 
-    run_phase({i: qs[:2] for i, qs in queries_by_item.items()})
+    if serper_key:  # 1º: Google Shopping (preço estruturado); a busca web só entra se faltar oferta
+        for i, qs in queries_by_item.items():
+            vistos = set()
+            for q in qs[:2]:
+                on_step(f"🛍️ Consultando Google Shopping: “{q}”")
+                try:
+                    res = serper_shopping(q, serper_key)
+                    logs[i].append({"consulta": f"[Google Shopping] {q}", "resultados": len(res), "erro": ""})
+                except Exception as e:
+                    avisos.append(f"Google Shopping: {e}")
+                    logs[i].append({"consulta": f"[Google Shopping] {q}", "resultados": 0, "erro": str(e)})
+                    continue
+                for c in res:
+                    chave = (c["loja"], c["preco"], c["titulo"])
+                    if chave not in vistos and len(cands[i]) < MAX_OFERTAS_SHOPPING:
+                        vistos.add(chave)
+                        c["id"] = f"{i}-{len(cands[i])}"
+                        cands[i].append(c)
+    run_phase({i: qs[:2] for i, qs in queries_by_item.items() if not cands[i]})
     retry = {i: [f"{qs[0]} site:{d}" for d in SITE_TARGETS] for i, qs in queries_by_item.items() if qs and not cands[i]}
     if retry:
         on_step("🔁 Nenhum preço encontrado na 1ª busca; tentando direto nas lojas...")
@@ -461,7 +520,7 @@ SCHEMA_RED = (
 )
 
 
-def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None) -> dict:
+def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None, serper_key: str = "") -> dict:
     avisos: list[str] = []
 
     # Agente 1 — Analista de Requisitos
@@ -517,7 +576,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
         if not queries[i]:
             queries[i] = [f"{it.get('nome_produto', '')} comprar preço"]
 
-    cands, sem_preco, logs = collect_quotes(queries, avisos, on_step)
+    cands, sem_preco, logs = collect_quotes(queries, avisos, on_step, serper_key)
     pesquisa_em = now_br().strftime("%d/%m/%Y %H:%M")
 
     # Filtro de sanidade: descarta preços absurdos (parcela, frete, acessório). Usa a faixa ampla estimada
@@ -556,7 +615,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
             "recondicionados, páginas de categoria ou produtos que claramente não atendem (ex.: menos memória que o mínimo) "
             "e liste-os em 'descartados' com um motivo curto. Em 'recomendado' informe o id da melhor oferta válida: "
             "priorize menor preço entre lojas confiáveis (loja_conhecida=true) e boas avaliações. "
-            "Descarte também ofertas cujo preço pareça absurdo para o produto. Não crie preços; apenas escolha ids. Preços vindos de 'trecho da busca' são menos confiáveis que os da página.\n"
+            "Descarte também ofertas cujo preço pareça absurdo para o produto. Não crie preços; apenas escolha ids. Preços vindos de 'trecho da busca' são menos confiáveis que os da página ou do Google Shopping.\n"
             f"Formato de saída: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
         )
         validacoes = {int(to_float(v.get("indice"), -1)): v for v in val.get("validacoes", [])}
@@ -594,7 +653,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
             melhor = by_id[rec] if rec in valid_ids else min(usadas, key=lambda c: c["preco"])
             precos = [c["preco"] for c in usadas]
             preco, faixa, ref = melhor["preco"], (min(precos), max(precos)), melhor["titulo"]
-            n_pag = sum(c["origem"] == "página do produto" for c in usadas)
+            n_pag = sum(c["origem"] in STRUCT_ORIGINS for c in usadas)
             if provisorio:
                 confianca = "baixa (não validada)"
             else:
@@ -602,8 +661,11 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
         else:
             preco, faixa, confianca, ref = 0.0, (0.0, 0.0), "sem cotação", ""
             if cs:
-                avisos.append(f"Item {i + 1} ({nome_item}): {len(cs)} oferta(s) encontrada(s), todas com preço fora da faixa plausível "
-                              "(provável parcela, frete ou acessório) — preencha o preço manualmente.")
+                vistos = ", ".join(brl(c["preco"]) for c in cs[:5])
+                fx = faixas.get(i)
+                faixa_txt = f" (faixa esperada: {brl(fx[0])} a {brl(fx[1])}, estimada pela IA)" if fx else ""
+                avisos.append(f"Item {i + 1} ({nome_item}): {len(cs)} oferta(s) com preço, mas todas fora da faixa plausível{faixa_txt}. "
+                              f"Valores vistos: {vistos}. Confira os links; se algum estiver correto, digite o preço na tabela.")
             else:
                 avisos.append(f"Item {i + 1} ({nome_item}): nenhuma oferta com preço foi encontrada na web — preencha o preço manualmente.")
         qtd = to_float(it.get("quantidade"), 1.0) or 1.0
@@ -657,6 +719,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
 
     cond = red.get("condicoes") or {}
     proposta = {
+        "_v": PROPOSTA_V,
         "empresa": empresa,
         "data": now_br().strftime("%d/%m/%Y"),
         "pesquisa_em": pesquisa_em,
@@ -813,6 +876,12 @@ with st.sidebar:
         else:
             api_key = st.text_input("Chave de API (Gemini)", type="password")
         base_url = st.text_input("Base URL (compatível com OpenAI)", value=get_secret("LLM_BASE_URL", DEFAULT_BASE_URL))
+        serper_key = get_secret("SERPER_API_KEY")
+        if serper_key:
+            st.success("Chave do Serper (Google Shopping) carregada dos Secrets.")
+        else:
+            serper_key = st.text_input("Chave do Serper (opcional, recomendada)", type="password",
+                                       help="Gratuita em serper.dev. Traz preços reais do Google Shopping.")
         want, want_fb = get_secret("LLM_MODEL", DEFAULT_MODEL), get_secret("LLM_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
         disponiveis = list_gemini_models(api_key, base_url) if api_key else []
         if disponiveis:
@@ -844,7 +913,7 @@ if st.button("Gerar Proposta Comercial", type="primary"):
             with st.spinner("Os agentes estão trabalhando (a pesquisa web pode levar um ou dois minutos)..."):
                 status = st.empty()
                 st.session_state["proposta"] = run_pipeline(
-                    LLM(api_key, base_url, model, fallback_model), edital_text.strip(), empresa, on_step=status.info
+                    LLM(api_key, base_url, model, fallback_model), edital_text.strip(), empresa, on_step=status.info, serper_key=serper_key
                 )
                 st.session_state["gen_id"] += 1
                 status.empty()
@@ -853,6 +922,10 @@ if st.button("Gerar Proposta Comercial", type="primary"):
             st.error(f"Não foi possível gerar a proposta: {e}")
 
 proposta = st.session_state.get("proposta")
+if proposta and proposta.get("_v") != PROPOSTA_V:  # gerada por uma versão antiga do app
+    st.session_state.pop("proposta", None)
+    proposta = None
+    st.info("O app foi atualizado. Gere a proposta novamente.")
 if proposta:
     st.divider()
     st.subheader("Revise os valores")
