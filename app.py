@@ -5,7 +5,8 @@ Streamlit + agentes modulares (papéis no estilo CrewAI) + busca web (ddgs) + Re
 Secrets (Streamlit Cloud > Settings > Secrets):
     LLM_API_KEY  = "sua-chave-gemini"
     LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"   # opcional
-    LLM_MODEL    = "gemini-2.5-flash"                                           # opcional
+    LLM_MODEL    = "gemini-3.8-flash"                                           # opcional
+    LLM_FALLBACK_MODEL = "gemini-3.5-flash-lite"                                 # opcional
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from xml.sax.saxutils import escape
 import pandas as pd
 import requests
 import streamlit as st
+import openai
 from openai import OpenAI
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_RIGHT
@@ -47,7 +49,8 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None
 
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 MAX_ITENS = 6                 # itens por edital (cada item gera buscas e downloads de páginas)
 MAX_PAGINAS_POR_ITEM = 6      # páginas de loja consultadas por item
 NAVY = colors.HexColor("#1F3A5F")
@@ -307,24 +310,77 @@ def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_
     return cands
 
 
+NON_TEXT_MODEL_HINTS = ("tts", "live", "image", "embedding", "transcribe", "robotics", "computer-use", "audio",
+                        "omni", "translate", "veo", "imagen", "lyria", "banana", "antigravity", "deep-research")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_gemini_models(api_key: str, base_url: str) -> list[str]:
+    """Pergunta à API quais modelos de texto a chave pode usar (os nomes mudam com o tempo)."""
+    try:
+        ids = [m.id.removeprefix("models/") for m in OpenAI(api_key=api_key, base_url=base_url, max_retries=1, timeout=20).models.list()]
+    except Exception:
+        return []
+    return sorted({i for i in ids if i.startswith("gemini") and not any(h in i for h in NON_TEXT_MODEL_HINTS)})
+
+
+def _flash_version(name: str):
+    m = re.fullmatch(r"gemini-(\d+(?:\.\d+)*)-flash(-lite)?", name)
+    return (tuple(int(x) for x in m.group(1).split(".")), bool(m.group(2))) if m else None
+
+
+def pick_defaults(models: list[str], want: str, want_fallback: str) -> tuple[str, str]:
+    """Usa os nomes configurados se existirem; senão escolhe os Flash/Flash-Lite estáveis mais novos."""
+    flash = sorted((m for m in models if (v := _flash_version(m)) and not v[1]), key=lambda m: _flash_version(m)[0], reverse=True)
+    lite = sorted((m for m in models if (v := _flash_version(m)) and v[1]), key=lambda m: _flash_version(m)[0], reverse=True)
+    main = want if want in models else (flash[0] if flash else models[0])
+    fb = want_fallback if want_fallback in models else (lite[0] if lite else next((m for m in flash if m != main), main))
+    return main, fb
+
+
 # ----------------------------------------------------------------------------
 # Camada de LLM e agentes
 # ----------------------------------------------------------------------------
+RETRY_WAITS = (3, 8, 16)  # segundos de espera entre tentativas quando o Gemini está sobrecarregado
+
+
 class LLM:
-    def __init__(self, api_key: str, base_url: str, model: str):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
+    def __init__(self, api_key: str, base_url: str, model: str, fallback_model: str = ""):
+        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=1, timeout=90)
+        self.models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
+
+    def _create(self, model: str, system: str, user: str):
+        return self.client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+
+    def _complete(self, system: str, user: str) -> str:
+        """Chama o modelo com novas tentativas (503/429/rede) e troca para o modelo reserva se preciso."""
+        last: Exception | None = None
+        for model in self.models:
+            for attempt in range(len(RETRY_WAITS) + 1):
+                try:
+                    return self._create(model, system, user).choices[0].message.content or ""
+                except (openai.RateLimitError, openai.InternalServerError, openai.APIConnectionError) as e:
+                    last = e
+                    if attempt < len(RETRY_WAITS):
+                        time.sleep(RETRY_WAITS[attempt])
+                except (openai.NotFoundError, openai.PermissionDeniedError) as e:  # modelo inexistente/sem acesso: próximo
+                    last = e
+                    break
+                # outros erros (chave inválida etc.) sobem direto
+        raise RuntimeError(
+            "O serviço do Gemini está sobrecarregado, sem cota ou indisponível no momento. "
+            f"Aguarde alguns minutos e tente de novo. (detalhe: {last})"
+        )
 
     def json_call(self, system: str, user: str, retries: int = 2) -> dict:
         last_error: Exception | None = None
         for _ in range(retries + 1):
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.2,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            )
             try:
-                return extract_json(resp.choices[0].message.content or "")
+                return extract_json(self._complete(system, user))
             except (ValueError, json.JSONDecodeError) as e:
                 last_error = e
         raise RuntimeError(f"Resposta da IA em formato inválido: {last_error}")
@@ -687,7 +743,18 @@ with st.sidebar:
         else:
             api_key = st.text_input("Chave de API (Gemini)", type="password")
         base_url = st.text_input("Base URL (compatível com OpenAI)", value=get_secret("LLM_BASE_URL", DEFAULT_BASE_URL))
-        model = st.text_input("Modelo", value=get_secret("LLM_MODEL", DEFAULT_MODEL))
+        want, want_fb = get_secret("LLM_MODEL", DEFAULT_MODEL), get_secret("LLM_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
+        disponiveis = list_gemini_models(api_key, base_url) if api_key else []
+        if disponiveis:
+            d_main, d_fb = pick_defaults(disponiveis, want, want_fb)
+            model = st.selectbox("Modelo", disponiveis, index=disponiveis.index(d_main))
+            fallback_model = st.selectbox("Modelo reserva (se o principal falhar)", disponiveis, index=disponiveis.index(d_fb))
+            st.caption(f"{len(disponiveis)} modelos de texto disponíveis para a sua chave.")
+        else:
+            model = st.text_input("Modelo", value=want)
+            fallback_model = st.text_input("Modelo reserva (se o principal falhar)", value=want_fb)
+            if api_key:
+                st.caption("Não consegui listar os modelos da sua chave; confira os nomes no Google AI Studio.")
 
 st.title("📄 Gerador de Propostas para Licitações")
 st.caption("Cole a especificação do edital: os agentes pesquisam preços reais na web e geram a proposta em PDF.")
@@ -707,7 +774,7 @@ if st.button("Gerar Proposta Comercial", type="primary"):
             with st.spinner("Os agentes estão trabalhando (a pesquisa web pode levar um ou dois minutos)..."):
                 status = st.empty()
                 st.session_state["proposta"] = run_pipeline(
-                    LLM(api_key, base_url, model), edital_text.strip(), empresa, on_step=status.info
+                    LLM(api_key, base_url, model, fallback_model), edital_text.strip(), empresa, on_step=status.info
                 )
                 st.session_state["gen_id"] += 1
                 status.empty()
