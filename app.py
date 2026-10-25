@@ -353,6 +353,7 @@ SCHEMA_REQ = (
 SCHEMA_QRY = '{"consultas":[{"indice":0,"queries":["",""]}]}'
 SCHEMA_VAL = (
     '{"validacoes":[{"indice":0,"validos":["id","id"],"recomendado":"id ou null",'
+    '"descartados":[{"id":"","motivo":"motivo curto"}],'
     '"descricao_comercial":"","justificativa":""}]}'
 )
 SCHEMA_RED = (
@@ -430,10 +431,12 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
             for i, cs in cands.items() if cs
         ]
         val = pesquisador.run(
-            "Para cada item, indique em 'validos' os ids das ofertas cujo título indica um produto que atende "
-            "às especificações obrigatórias (descarte acessórios, peças, kits, produtos inferiores, páginas de categoria). "
-            "Em 'recomendado' informe o id da melhor oferta: priorize menor preço entre lojas confiáveis "
-            "(loja_conhecida=true) e boas avaliações. Se nenhuma servir, deixe 'validos' vazio e 'recomendado' null. "
+            "Para cada item, indique em 'validos' os ids das ofertas que são do MESMO TIPO de produto e que NÃO "
+            "contradizem as especificações. Títulos de loja raramente listam todas as especificações: a ausência de uma "
+            "especificação no título NÃO é motivo para descartar. Descarte apenas acessórios, peças, kits, usados ou "
+            "recondicionados, páginas de categoria ou produtos que claramente não atendem (ex.: menos memória que o mínimo) "
+            "e liste-os em 'descartados' com um motivo curto. Em 'recomendado' informe o id da melhor oferta válida: "
+            "priorize menor preço entre lojas confiáveis (loja_conhecida=true) e boas avaliações. "
             "Não crie preços; apenas escolha ids. Preços vindos de 'trecho da busca' são menos confiáveis que os da página.\n"
             f"Formato de saída: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
         )
@@ -441,28 +444,50 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
 
     linhas = []
     for i, it in enumerate(itens):
+        nome_item = str(it.get("nome_produto") or f"Item {i + 1}")
         v = validacoes.get(i, {})
-        by_id = {c["id"]: c for c in cands.get(i, [])}
+        cs = cands.get(i, [])
+        by_id = {c["id"]: c for c in cs}
         valid_ids = [x for x in as_list(v.get("validos")) if x in by_id]
         rec = str(v.get("recomendado") or "")
-        validos = [by_id[x] for x in valid_ids]
-        for c in cands.get(i, []):
+        motivos = {str(d.get("id")): str(d.get("motivo") or "") for d in (v.get("descartados") or []) if isinstance(d, dict)}
+        for c in cs:
             c["validada"] = c["id"] in valid_ids
-        if validos:
-            precos = [c["preco"] for c in validos]
-            preco = by_id[rec]["preco"] if rec in valid_ids else min(precos)
-            faixa = (min(precos), max(precos))
-            n_pag = sum(c["origem"] == "página do produto" for c in validos)
-            confianca = "alta" if n_pag >= 3 else "média" if (len(validos) >= 2 or n_pag >= 1) else "baixa"
-            ref = by_id[rec]["titulo"] if rec in valid_ids else validos[0]["titulo"]
+            c["motivo"] = motivos.get(c["id"], "")
+            c["usada"] = False
+        usadas = [by_id[x] for x in valid_ids]
+        provisorio = False
+        if cs and not usadas:
+            # A IA não validou nada: usa as ofertas achadas como PROVISÓRIAS (ignora preços muito abaixo da
+            # mediana, típicos de acessórios) e avisa o usuário para conferir os links.
+            ordenados = sorted(c["preco"] for c in cs)
+            mediana = ordenados[len(ordenados) // 2]
+            usadas = [c for c in cs if c["preco"] >= 0.3 * mediana]
+            provisorio = True
+            extra = " (a IA não devolveu validação)" if i not in validacoes else ""
+            avisos.append(
+                f"Item {i + 1} ({nome_item}): a IA não validou nenhuma oferta{extra}. O preço é PROVISÓRIO "
+                "(menor valor encontrado): abra os links e confira se o produto atende ao edital."
+            )
+        if usadas:
+            for c in usadas:
+                c["usada"] = True
+            melhor = by_id[rec] if rec in valid_ids else min(usadas, key=lambda c: c["preco"])
+            precos = [c["preco"] for c in usadas]
+            preco, faixa, ref = melhor["preco"], (min(precos), max(precos)), melhor["titulo"]
+            n_pag = sum(c["origem"] == "página do produto" for c in usadas)
+            if provisorio:
+                confianca = "baixa (não validada)"
+            else:
+                confianca = "alta" if n_pag >= 3 else "média" if (len(usadas) >= 2 or n_pag >= 1) else "baixa"
         else:
             preco, faixa, confianca, ref = 0.0, (0.0, 0.0), "sem cotação", ""
-            avisos.append(f"Item {i + 1} ({it.get('nome_produto')}): nenhuma oferta real validada — preencha o preço manualmente.")
+            avisos.append(f"Item {i + 1} ({nome_item}): nenhuma oferta com preço foi encontrada na web — preencha o preço manualmente.")
         qtd = to_float(it.get("quantidade"), 1.0) or 1.0
         linhas.append(
             {
                 "numero": i + 1,
-                "nome": str(it.get("nome_produto") or f"Item {i + 1}"),
+                "nome": nome_item,
                 "unidade": str(it.get("unidade") or "un"),
                 "quantidade": qtd,
                 "preco_unitario": round(preco, 2),
@@ -472,7 +497,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
                 "requisitos": as_list(it.get("requisitos_minimos")),
                 "descricao": str(v.get("descricao_comercial") or ""),
                 "produto_referencia": ref,
-                "cotacoes": cands.get(i, []),
+                "cotacoes": cs,
                 "confianca": confianca,
                 "justificativa": str(v.get("justificativa") or ""),
             }
@@ -610,10 +635,10 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
         story += [PageBreak(), P("ANEXO — Pesquisa de preços", h2),
                   P(f"Consulta realizada em {p['pesquisa_em']}. Valores sujeitos a variação sem aviso prévio.", small), Spacer(1, 6)]
         for l in p["linhas"]:
-            validas = [q for q in l["cotacoes"] if q.get("validada")]
+            validas = [q for q in l["cotacoes"] if q.get("usada")]
             story.append(P(f"Item {l['numero']} — {l['nome']}", ParagraphStyle("b2", parent=base, fontName="Helvetica-Bold", spaceBefore=6, spaceAfter=3)))
             if not validas:
-                story.append(P("Sem ofertas validadas na pesquisa.", small))
+                story.append(P("Sem ofertas utilizadas na pesquisa.", small))
                 continue
             rows = [[P(h, th) for h in ("Loja", "Preço", "Link")]]
             for q in validas:
@@ -730,9 +755,9 @@ if proposta:
             if l["cotacoes"]:
                 st.dataframe(
                     pd.DataFrame([
-                        {"Validada": q.get("validada", False), "Loja": q["loja"], "Produto": q["titulo"], "Preço": q["preco"],
-                         "Origem do preço": q["origem"], "Nota": q["nota"], "Avaliações": q["n_avaliacoes"],
-                         "Loja conhecida": q["loja_conhecida"], "Link": q["url"]}
+                        {"Validada pela IA": q.get("validada", False), "Usada no preço": q.get("usada", False), "Loja": q["loja"],
+                         "Produto": q["titulo"], "Preço": q["preco"], "Origem do preço": q["origem"], "Nota": q["nota"],
+                         "Avaliações": q["n_avaliacoes"], "Motivo do descarte": q.get("motivo", ""), "Link": q["url"]}
                         for q in l["cotacoes"]
                     ]),
                     hide_index=True,
