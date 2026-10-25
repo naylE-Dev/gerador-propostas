@@ -250,11 +250,17 @@ def parse_product_page(html: str) -> dict:
     return info
 
 
+_BAD_CONTEXT = re.compile(r"frete|cupom|desconto|\boff\b|economi|cashback|parcel|juros|entrada|acima de|taxa", re.I)
+
+
 def price_from_text(text: str) -> float | None:
-    """Primeiro preço 'à vista' do texto, ignorando parcelas ('12x de R$ 99,90')."""
+    """Primeiro preço 'à vista' do texto, ignorando parcelas, frete, cupom, desconto e preço antigo."""
     for m in _PRICE_RE.finditer(text):
-        before = text[max(0, m.start() - 14) : m.start()].lower()
-        if re.search(r"\d\s*x\s*(de\s*)?$", before) or "parcel" in before:
+        before = text[max(0, m.start() - 30) : m.start()].lower()
+        after = text[m.end() : m.end() + 14].lower()
+        if re.search(r"\d\s*x\s*(de\s*)?$", before) or _BAD_CONTEXT.search(before[-14:] + " " + after):
+            continue
+        if re.match(r"\s*por\b", after):  # "de R$ 3.999 por R$ 2.999": ignora o preço antigo
             continue
         p = to_float(m.group(1))
         if p > 0:
@@ -442,7 +448,7 @@ SCHEMA_REQ = (
     '{"itens":[{"nome_produto":"","especificacoes_obrigatorias":[""],'
     '"quantidade":1,"unidade":"un","requisitos_minimos":[""]}]}'
 )
-SCHEMA_QRY = '{"consultas":[{"indice":0,"queries":["",""]}]}'
+SCHEMA_QRY = '{"consultas":[{"indice":0,"queries":["",""],"faixa_preco_unitario_brl":{"min":0,"max":0}}]}'
 SCHEMA_VAL = (
     '{"validacoes":[{"indice":0,"validos":["id","id"],"recomendado":"id ou null",'
     '"descartados":[{"id":"","motivo":"motivo curto"}],'
@@ -491,14 +497,22 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
     )
     qry = pesquisador.run(
         "Para cada item, crie 2 consultas curtas (4 a 8 palavras) em português do Brasil para achar o produto "
-        "à venda em lojas online (inclua 'comprar' ou 'preço' e as 2 ou 3 especificações mais importantes).\n"
+        "à venda em lojas online (inclua 'comprar' ou 'preço' e as 2 ou 3 especificações mais importantes). "
+        "Informe também, pelo seu conhecimento geral, uma faixa AMPLA de preço unitário plausível em reais (min e max) "
+        "para esse produto: ela só servirá para descartar valores absurdos (parcela, frete, acessório), nunca como preço.\n"
         f"Formato de saída: {SCHEMA_QRY}\n\nITENS:\n{json.dumps(itens, ensure_ascii=False)}"
     )
     queries = {i: [] for i in range(len(itens))}
+    faixas: dict[int, tuple[float, float]] = {}
     for c in qry.get("consultas", []):
         idx = int(to_float(c.get("indice"), -1))
         if idx in queries:
             queries[idx] = as_list(c.get("queries"))
+            f = c.get("faixa_preco_unitario_brl")
+            if isinstance(f, dict):
+                lo, hi = to_float(f.get("min")), to_float(f.get("max"))
+                if 0 < lo < hi:
+                    faixas[idx] = (lo, hi)
     for i, it in enumerate(itens):
         if not queries[i]:
             queries[i] = [f"{it.get('nome_produto', '')} comprar preço"]
@@ -506,22 +520,35 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
     cands, sem_preco, logs = collect_quotes(queries, avisos, on_step)
     pesquisa_em = now_br().strftime("%d/%m/%Y %H:%M")
 
+    # Filtro de sanidade: descarta preços absurdos (parcela, frete, acessório). Usa a faixa ampla estimada
+    # pela IA (só como filtro, nunca como preço) e, com 3+ ofertas, a mediana das que passaram.
+    for i, cs in cands.items():
+        fx = faixas.get(i)
+        for c in cs:
+            c["implausivel"] = bool(fx) and not (0.5 * fx[0] <= c["preco"] <= 2 * fx[1])
+        ok = sorted(c["preco"] for c in cs if not c["implausivel"])
+        if len(ok) >= 3:
+            med = ok[len(ok) // 2]
+            for c in cs:
+                if not c["implausivel"] and not (0.3 * med <= c["preco"] <= 3 * med):
+                    c["implausivel"] = True
+
     validacoes: dict[int, dict] = {}
-    if any(cands.values()):
+    payload = [
+        {
+            "indice": i,
+            "item": itens[i].get("nome_produto"),
+            "especificacoes_obrigatorias": itens[i].get("especificacoes_obrigatorias"),
+            "requisitos_minimos": itens[i].get("requisitos_minimos"),
+            "ofertas": [
+                {k: c[k] for k in ("id", "titulo", "loja", "loja_conhecida", "preco", "origem", "nota", "n_avaliacoes")}
+                for c in cs if not c["implausivel"]
+            ],
+        }
+        for i, cs in cands.items() if any(not c["implausivel"] for c in cs)
+    ]
+    if payload:
         on_step("🧪 Agente 2/3 — Validando as ofertas encontradas...")
-        payload = [
-            {
-                "indice": i,
-                "item": itens[i].get("nome_produto"),
-                "especificacoes_obrigatorias": itens[i].get("especificacoes_obrigatorias"),
-                "requisitos_minimos": itens[i].get("requisitos_minimos"),
-                "ofertas": [
-                    {k: c[k] for k in ("id", "titulo", "loja", "loja_conhecida", "preco", "origem", "nota", "n_avaliacoes")}
-                    for c in cs
-                ],
-            }
-            for i, cs in cands.items() if cs
-        ]
         val = pesquisador.run(
             "Para cada item, indique em 'validos' os ids das ofertas que são do MESMO TIPO de produto e que NÃO "
             "contradizem as especificações. Títulos de loja raramente listam todas as especificações: a ausência de uma "
@@ -529,7 +556,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
             "recondicionados, páginas de categoria ou produtos que claramente não atendem (ex.: menos memória que o mínimo) "
             "e liste-os em 'descartados' com um motivo curto. Em 'recomendado' informe o id da melhor oferta válida: "
             "priorize menor preço entre lojas confiáveis (loja_conhecida=true) e boas avaliações. "
-            "Não crie preços; apenas escolha ids. Preços vindos de 'trecho da busca' são menos confiáveis que os da página.\n"
+            "Descarte também ofertas cujo preço pareça absurdo para o produto. Não crie preços; apenas escolha ids. Preços vindos de 'trecho da busca' são menos confiáveis que os da página.\n"
             f"Formato de saída: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
         )
         validacoes = {int(to_float(v.get("indice"), -1)): v for v in val.get("validacoes", [])}
@@ -539,22 +566,22 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
         nome_item = str(it.get("nome_produto") or f"Item {i + 1}")
         v = validacoes.get(i, {})
         cs = cands.get(i, [])
-        by_id = {c["id"]: c for c in cs}
+        by_id = {c["id"]: c for c in cs if not c["implausivel"]}
         valid_ids = [x for x in as_list(v.get("validos")) if x in by_id]
         rec = str(v.get("recomendado") or "")
         motivos = {str(d.get("id")): str(d.get("motivo") or "") for d in (v.get("descartados") or []) if isinstance(d, dict)}
         for c in cs:
             c["validada"] = c["id"] in valid_ids
-            c["motivo"] = motivos.get(c["id"], "")
+            c["motivo"] = "preço fora da faixa plausível (provável parcela, frete ou acessório)" if c["implausivel"] else motivos.get(c["id"], "")
             c["usada"] = False
         usadas = [by_id[x] for x in valid_ids]
         provisorio = False
-        if cs and not usadas:
+        if by_id and not usadas:
             # A IA não validou nada: usa as ofertas achadas como PROVISÓRIAS (ignora preços muito abaixo da
             # mediana, típicos de acessórios) e avisa o usuário para conferir os links.
-            ordenados = sorted(c["preco"] for c in cs)
+            ordenados = sorted(c["preco"] for c in by_id.values())
             mediana = ordenados[len(ordenados) // 2]
-            usadas = [c for c in cs if c["preco"] >= 0.3 * mediana]
+            usadas = [c for c in by_id.values() if c["preco"] >= 0.3 * mediana]
             provisorio = True
             extra = " (a IA não devolveu validação)" if i not in validacoes else ""
             avisos.append(
@@ -574,7 +601,11 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
                 confianca = "alta" if n_pag >= 3 else "média" if (len(usadas) >= 2 or n_pag >= 1) else "baixa"
         else:
             preco, faixa, confianca, ref = 0.0, (0.0, 0.0), "sem cotação", ""
-            avisos.append(f"Item {i + 1} ({nome_item}): nenhuma oferta com preço foi encontrada na web — preencha o preço manualmente.")
+            if cs:
+                avisos.append(f"Item {i + 1} ({nome_item}): {len(cs)} oferta(s) encontrada(s), todas com preço fora da faixa plausível "
+                              "(provável parcela, frete ou acessório) — preencha o preço manualmente.")
+            else:
+                avisos.append(f"Item {i + 1} ({nome_item}): nenhuma oferta com preço foi encontrada na web — preencha o preço manualmente.")
         qtd = to_float(it.get("quantidade"), 1.0) or 1.0
         linhas.append(
             {
@@ -591,6 +622,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
                 "produto_referencia": ref,
                 "cotacoes": cs,
                 "sem_preco": sem_preco.get(i, []),
+                "faixa_plausivel": faixas.get(i),
                 "diagnostico": logs.get(i, []),
                 "confianca": confianca,
                 "justificativa": str(v.get("justificativa") or ""),
@@ -860,6 +892,9 @@ if proposta:
         ):
             if l["justificativa"]:
                 st.write(f"**Justificativa da escolha:** {l['justificativa']}")
+            if l["faixa_plausivel"]:
+                lo, hi = l["faixa_plausivel"]
+                st.caption(f"Faixa ampla usada só para descartar valores absurdos (estimativa da IA, não é preço): {brl(lo)} a {brl(hi)}.")
             if l["diagnostico"]:
                 st.markdown("**Buscas realizadas**")
                 for d in l["diagnostico"]:
