@@ -27,6 +27,7 @@ from xml.sax.saxutils import escape
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image as PILImage
 import openai
 from openai import OpenAI
 from reportlab.lib import colors
@@ -34,7 +35,7 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
-from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image as RLImage, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 try:  # "ddgs" é o novo nome do pacote "duckduckgo_search" (que foi descontinuado)
     from ddgs import DDGS
@@ -52,7 +53,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
-PROPOSTA_V = 3                # muda quando o formato dos dados muda (descarta resultados antigos da sessão)
+PROPOSTA_V = 4                # muda quando o formato dos dados muda (descarta resultados antigos da sessão)
 MAX_ITENS = 6                 # itens por edital (cada item gera buscas e downloads de páginas)
 MAX_PAGINAS_POR_ITEM = 6      # páginas de loja consultadas por item
 MAX_OFERTAS_SHOPPING = 12
@@ -183,7 +184,7 @@ def serper_shopping(query: str, api_key: str, n: int = 10) -> list[dict]:
             "titulo": str(it.get("title") or "")[:160], "url": it.get("link") or "", "loja": loja,
             "loja_conhecida": _known_store(loja), "preco": preco, "origem": "Google Shopping (Serper)",
             "nota": to_float(it.get("rating"), 0.0) or None, "n_avaliacoes": int(to_float(it.get("ratingCount"), 0)) or None,
-            "motivo_sem_preco": "",
+            "motivo_sem_preco": "", "imagem_url": it.get("imageUrl") or it.get("thumbnailUrl") or "",
         })
     return out
 
@@ -233,8 +234,62 @@ def fetch_html(url: str, max_bytes: int = 1_500_000) -> tuple[str, str]:
         return "", f"erro de rede ({type(e).__name__})"
 
 
+def normalize_image(data: bytes) -> bytes | None:
+    """Converte qualquer imagem comum para JPEG RGB (fundo branco, até 700 px). None se não for legível."""
+    try:
+        im = PILImage.open(io.BytesIO(data))
+        im.load()
+        if im.mode != "RGB":
+            im = im.convert("RGBA")
+            bg = PILImage.new("RGB", im.size, "white")
+            bg.paste(im, mask=im.split()[3])
+            im = bg
+        im.thumbnail((700, 700))
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=85)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def fetch_image(url: str, max_bytes: int = 3_000_000) -> bytes | None:
+    """Baixa uma imagem pública (validando destino e tamanho) e a normaliza."""
+    try:
+        for _ in range(4):
+            if not is_public_url(url):
+                return None
+            r = requests.get(url, headers=HEADERS, timeout=8, stream=True, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                url = urljoin(url, r.headers.get("location", ""))
+                r.close()
+                continue
+            if r.status_code != 200 or not r.headers.get("content-type", "").lower().startswith("image/"):
+                r.close()
+                return None
+            data = b""
+            for chunk in r.iter_content(65536):
+                data += chunk
+                if len(data) > max_bytes:
+                    r.close()
+                    return None
+            r.close()
+            return normalize_image(data)
+    except Exception:
+        return None
+    return None
+
+
+def first_image(urls: list[str]) -> tuple[bytes | None, str]:
+    for u in urls:
+        img = fetch_image(u)
+        if img:
+            return img, u
+    return None, ""
+
+
 _LD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
-_META_PRICE_RE = re.compile(
+_META_OG_IMG_RE = re.compile(r'<meta[^>]+(?:property|name)=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+_PRICE_RE = re.compile(
     r'<meta[^>]+(?:property|itemprop|name)=["\'](?:product:price:amount|og:price:amount|price)["\'][^>]+content=["\']([^"\']+)["\']', re.I
 )
 _PRICE_RE = re.compile(r"R\$\s?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+(?:,\d{2})?)")
@@ -325,7 +380,9 @@ def enrich_result(r: dict) -> dict:
         motivo = f"página não lida: {status}"
     else:
         motivo = "página lida, mas sem preço estruturado e sem preço no trecho da busca"
+    og = _OG_IMG_RE.search(html) if html else None
     return {
+        "imagem_url": urljoin(url, og.group(1)) if og else "",
         "titulo": (info.get("nome") or r.get("title") or "")[:160],
         "url": url,
         "loja": host,
@@ -635,6 +692,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None,
             c["usada"] = False
         usadas = [by_id[x] for x in valid_ids]
         provisorio = False
+        img_urls: list[str] = []
         if by_id and not usadas:
             # A IA não validou nada: usa as ofertas achadas como PROVISÓRIAS (ignora preços muito abaixo da
             # mediana, típicos de acessórios) e avisa o usuário para conferir os links.
@@ -651,6 +709,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None,
             for c in usadas:
                 c["usada"] = True
             melhor = by_id[rec] if rec in valid_ids else min(usadas, key=lambda c: c["preco"])
+            img_urls = list(dict.fromkeys(c.get("imagem_url") for c in [melhor] + sorted(usadas, key=lambda c: c["preco"]) if c.get("imagem_url")))[:3]
             precos = [c["preco"] for c in usadas]
             preco, faixa, ref = melhor["preco"], (min(precos), max(precos)), melhor["titulo"]
             n_pag = sum(c["origem"] in STRUCT_ORIGINS for c in usadas)
@@ -685,11 +744,24 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None,
                 "cotacoes": cs,
                 "sem_preco": sem_preco.get(i, []),
                 "faixa_plausivel": faixas.get(i),
+                "imagem_candidatas": img_urls,
+                "imagem_auto": None,
                 "diagnostico": logs.get(i, []),
                 "confianca": confianca,
                 "justificativa": str(v.get("justificativa") or ""),
             }
         )
+
+    # Imagens dos produtos (da oferta escolhida; o usuário pode trocar ou remover na tela)
+    if any(l["imagem_candidatas"] for l in linhas):
+        on_step("🖼️ Baixando imagens dos produtos...")
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [(l, ex.submit(first_image, l["imagem_candidatas"])) for l in linhas if l["imagem_candidatas"]]
+            for l, f in futs:
+                try:
+                    l["imagem_auto"] = f.result()[0]
+                except Exception:
+                    pass
 
     # Agente 3 — Redator de Propostas
     on_step("✍️ Agente 3/3 — Redigindo a proposta formal...")
@@ -791,7 +863,7 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
             P(fmt_qtd(l["quantidade"]), center), P(brl(l["preco_unitario"]), right), P(brl(l["subtotal"]), right),
         ])
     rows.append([P("VALOR TOTAL DA PROPOSTA", bold_r), "", "", "", "", P(brl(p["total"]), bold_r)])
-    it = Table(rows, colWidths=[1.0 * cm, 7.0 * cm, 1.3 * cm, 1.7 * cm, 3.0 * cm, 3.0 * cm], repeatRows=1)
+    it = Table(rows, colWidths=[1.3 * cm, 6.7 * cm, 1.3 * cm, 1.7 * cm, 3.0 * cm, 3.0 * cm], repeatRows=1)
     it.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("SPAN", (0, -1), (4, -1)), ("BACKGROUND", (0, -1), (-1, -1), LIGHT),
@@ -800,10 +872,26 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
     story.append(it)
 
     story.append(P("4. Especificações técnicas", h2))
+    cap = ParagraphStyle("cap", parent=base, fontSize=7.5, leading=9, alignment=TA_CENTER, textColor=colors.grey)
     for l in p["linhas"]:
         story.append(P(f"Item {l['numero']} — {l['nome']}", ParagraphStyle("b", parent=base, fontName="Helvetica-Bold", spaceBefore=4, spaceAfter=2)))
-        for s in l["especificacoes_finais"] or ["Conforme especificação do edital."]:
-            story.append(Paragraph(escape(s), bullet, bulletText="•"))
+        bullets = [Paragraph(escape(s), bullet, bulletText="•") for s in (l["especificacoes_finais"] or ["Conforme especificação do edital."])]
+        placed = False
+        if l.get("imagem") and len(bullets) <= 25:
+            try:
+                w, h = PILImage.open(io.BytesIO(l["imagem"])).size
+                s = min(4.2 * cm / w, 4.2 * cm / h)
+                cell = [RLImage(io.BytesIO(l["imagem"]), width=w * s, height=h * s)]
+                if l.get("imagem_legenda"):
+                    cell.append(P(l["imagem_legenda"], cap))
+                tb = Table([[bullets, cell]], colWidths=[12.6 * cm, 4.4 * cm])
+                tb.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+                story.append(tb)
+                placed = True
+            except Exception:
+                placed = False
+        if not placed:
+            story += bullets
 
     c = p["condicoes"]
     story.append(P("5. Condições comerciais", h2))
@@ -958,6 +1046,7 @@ if proposta:
     recalc(final)
 
     st.metric("Valor total da proposta", brl(final["total"]))
+    incluir_imagens = st.checkbox("Incluir imagens dos produtos no PDF", value=True)
     for l in final["linhas"]:
         with st.expander(
             f"Item {l['numero']} — {l['nome']}  ·  ofertas: {len(l['cotacoes'])}  ·  confiança: {l['confianca']}",
@@ -965,6 +1054,21 @@ if proposta:
         ):
             if l["justificativa"]:
                 st.write(f"**Justificativa da escolha:** {l['justificativa']}")
+            gid = f"{st.session_state['gen_id']}_{l['numero']}"
+            img, legenda = None, ""
+            up = st.file_uploader("Enviar minha própria imagem (PNG, JPG ou WEBP)", type=["png", "jpg", "jpeg", "webp"], key=f"up_{gid}")
+            if up is not None:
+                img = normalize_image(up.getvalue())
+                if img is None:
+                    st.warning("Não consegui ler essa imagem.")
+            elif l.get("imagem_auto"):
+                if st.checkbox("Usar a imagem encontrada na pesquisa (ilustrativa)", value=True, key=f"auto_{gid}"):
+                    img, legenda = l["imagem_auto"], "Imagem ilustrativa"
+            else:
+                st.caption("Nenhuma imagem automática encontrada para este item.")
+            if img:
+                st.image(img, width=180)
+            l["imagem"], l["imagem_legenda"] = (img, legenda) if incluir_imagens else (None, "")
             if l["faixa_plausivel"]:
                 lo, hi = l["faixa_plausivel"]
                 st.caption(f"Faixa ampla usada só para descartar valores absurdos (estimativa da IA, não é preço): {brl(lo)} a {brl(hi)}.")
