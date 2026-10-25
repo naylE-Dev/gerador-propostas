@@ -60,7 +60,9 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
 # Domínios que não são lojas
-BLOCKED_DOMAINS = ("youtube.", "wikipedia.", "facebook.", "instagram.", "reddit.", "pinterest.", "tiktok.", "twitter.", "x.com", "linkedin.")
+BLOCKED_DOMAINS = ("youtube.com", "wikipedia.org", "facebook.com", "instagram.com", "reddit.com", "pinterest.com",
+                   "tiktok.com", "twitter.com", "x.com", "linkedin.com")
+SITE_TARGETS = ("mercadolivre.com.br", "kabum.com.br", "magazineluiza.com.br")  # 2ª tentativa: busca direto nas lojas
 # Varejistas conhecidos (heurística de "loja confiável" — ajuste à vontade)
 KNOWN_STORES = (
     "mercadolivre", "amazon.com.br", "kabum", "magazineluiza", "magalu", "americanas", "casasbahia", "pontofrio",
@@ -162,26 +164,34 @@ def is_public_url(url: str) -> bool:
         return False
 
 
-def fetch_html(url: str, max_bytes: int = 1_500_000) -> str:
-    for _ in range(4):  # segue até 3 redirecionamentos, validando cada destino
-        if not is_public_url(url):
-            return ""
-        r = requests.get(url, headers=HEADERS, timeout=7, stream=True, allow_redirects=False)
-        if r.status_code in (301, 302, 303, 307, 308):
-            url = urljoin(url, r.headers.get("location", ""))
+def fetch_html(url: str, max_bytes: int = 1_500_000) -> tuple[str, str]:
+    """Baixa a página. Retorna (html, status); html vazio quando não foi possível ler."""
+    try:
+        for _ in range(4):  # segue até 3 redirecionamentos, validando cada destino
+            if not is_public_url(url):
+                return "", "endereço não permitido"
+            r = requests.get(url, headers=HEADERS, timeout=7, stream=True, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                url = urljoin(url, r.headers.get("location", ""))
+                r.close()
+                continue
+            if r.status_code != 200:
+                code = r.status_code
+                r.close()
+                return "", f"HTTP {code} (a loja pode bloquear leitura automática)"
+            if "html" not in r.headers.get("content-type", "").lower():
+                r.close()
+                return "", "não é uma página HTML"
+            data = b""
+            for chunk in r.iter_content(65536):
+                data += chunk
+                if len(data) >= max_bytes:
+                    break
             r.close()
-            continue
-        if r.status_code != 200 or "html" not in r.headers.get("content-type", "").lower():
-            r.close()
-            return ""
-        data = b""
-        for chunk in r.iter_content(65536):
-            data += chunk
-            if len(data) >= max_bytes:
-                break
-        r.close()
-        return data.decode(r.encoding or "utf-8", errors="ignore")
-    return ""
+            return data.decode(r.encoding or "utf-8", errors="ignore"), "ok"
+        return "", "redirecionamentos demais"
+    except Exception as e:
+        return "", f"erro de rede ({type(e).__name__})"
 
 
 _LD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
@@ -254,8 +264,9 @@ def price_from_text(text: str) -> float | None:
 
 def enrich_result(r: dict) -> dict:
     url, host = r.get("href", ""), host_of(r.get("href", ""))
+    html, status = fetch_html(url)
     try:
-        info = parse_product_page(fetch_html(url))
+        info = parse_product_page(html) if html else {}
     except Exception:
         info = {}
     preco, origem = info.get("preco"), "página do produto"
@@ -263,6 +274,12 @@ def enrich_result(r: dict) -> dict:
         preco, origem = price_from_text(f"{r.get('title', '')} {r.get('body', '')}"), "trecho da busca"
     if preco and not (1 <= preco <= 5_000_000):
         preco = None
+    if preco:
+        motivo = ""
+    elif not html:
+        motivo = f"página não lida: {status}"
+    else:
+        motivo = "página lida, mas sem preço estruturado e sem preço no trecho da busca"
     return {
         "titulo": (info.get("nome") or r.get("title") or "")[:160],
         "url": url,
@@ -272,42 +289,61 @@ def enrich_result(r: dict) -> dict:
         "origem": origem if preco else None,
         "nota": info.get("nota"),
         "n_avaliacoes": info.get("n"),
+        "motivo_sem_preco": motivo,
     }
 
 
-def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_step=lambda m: None) -> dict[int, list[dict]]:
-    """Busca cada item na web, abre as páginas e devolve candidatos COM preço real."""
-    raw: dict[int, list[dict]] = {}
-    for i, queries in queries_by_item.items():
-        seen, found = set(), []
-        for q in queries[:2]:
-            on_step(f"🌐 Pesquisando na web: “{q}”")
-            try:
-                results = search_web(q)
-            except Exception as e:
-                avisos.append(str(e))
-                continue
-            for r in results:
-                url, host = r.get("href") or "", host_of(r.get("href") or "")
-                if url and url not in seen and not any(b in host for b in BLOCKED_DOMAINS):
-                    seen.add(url)
-                    found.append(r)
-            time.sleep(0.8)  # evita bloqueio por excesso de requisições
-        raw[i] = found[:MAX_PAGINAS_POR_ITEM]
+def _is_blocked(host: str) -> bool:
+    return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
 
-    on_step("🛒 Lendo as páginas das lojas para extrair preços e avaliações...")
-    cands: dict[int, list[dict]] = {i: [] for i in raw}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = [(i, ex.submit(enrich_result, r)) for i, rs in raw.items() for r in rs]
-        for i, f in futures:
-            try:
-                c = f.result()
-            except Exception:
-                continue
-            if c["preco"]:
-                c["id"] = f"{i}-{len(cands[i])}"
-                cands[i].append(c)
-    return cands
+
+def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_step=lambda m: None):
+    """Busca cada item na web, abre as páginas e devolve (ofertas com preço, páginas sem preço, log das buscas)."""
+    cands = {i: [] for i in queries_by_item}
+    sem_preco = {i: [] for i in queries_by_item}
+    logs = {i: [] for i in queries_by_item}
+    seen = {i: set() for i in queries_by_item}
+
+    def run_phase(qs_by_item: dict[int, list[str]]) -> None:
+        found: dict[int, list[dict]] = {}
+        for i, qs in qs_by_item.items():
+            found[i] = []
+            for q in qs:
+                on_step(f"🌐 Pesquisando na web: “{q}”")
+                try:
+                    results = search_web(q)
+                    logs[i].append({"consulta": q, "resultados": len(results), "erro": ""})
+                except Exception as e:
+                    avisos.append(str(e))
+                    logs[i].append({"consulta": q, "resultados": 0, "erro": str(e)})
+                    continue
+                for r in results:
+                    url, host = r.get("href") or "", host_of(r.get("href") or "")
+                    if url and url not in seen[i] and not _is_blocked(host):
+                        seen[i].add(url)
+                        found[i].append(r)
+                time.sleep(0.8)  # evita bloqueio por excesso de requisições
+            found[i] = found[i][:MAX_PAGINAS_POR_ITEM]
+        on_step("🛒 Lendo as páginas das lojas para extrair preços e avaliações...")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [(i, ex.submit(enrich_result, r)) for i, rs in found.items() for r in rs]
+            for i, f in futures:
+                try:
+                    c = f.result()
+                except Exception:
+                    continue
+                if c["preco"]:
+                    c["id"] = f"{i}-{len(cands[i])}"
+                    cands[i].append(c)
+                else:
+                    sem_preco[i].append(c)
+
+    run_phase({i: qs[:2] for i, qs in queries_by_item.items()})
+    retry = {i: [f"{qs[0]} site:{d}" for d in SITE_TARGETS] for i, qs in queries_by_item.items() if qs and not cands[i]}
+    if retry:
+        on_step("🔁 Nenhum preço encontrado na 1ª busca; tentando direto nas lojas...")
+        run_phase(retry)
+    return cands, sem_preco, logs
 
 
 NON_TEXT_MODEL_HINTS = ("tts", "live", "image", "embedding", "transcribe", "robotics", "computer-use", "audio",
@@ -467,7 +503,7 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
         if not queries[i]:
             queries[i] = [f"{it.get('nome_produto', '')} comprar preço"]
 
-    cands = collect_quotes(queries, avisos, on_step)
+    cands, sem_preco, logs = collect_quotes(queries, avisos, on_step)
     pesquisa_em = now_br().strftime("%d/%m/%Y %H:%M")
 
     validacoes: dict[int, dict] = {}
@@ -554,6 +590,8 @@ def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None)
                 "descricao": str(v.get("descricao_comercial") or ""),
                 "produto_referencia": ref,
                 "cotacoes": cs,
+                "sem_preco": sem_preco.get(i, []),
+                "diagnostico": logs.get(i, []),
                 "confianca": confianca,
                 "justificativa": str(v.get("justificativa") or ""),
             }
@@ -816,10 +854,18 @@ if proposta:
 
     st.metric("Valor total da proposta", brl(final["total"]))
     for l in final["linhas"]:
-        with st.expander(f"Item {l['numero']} — {l['nome']}  ·  ofertas: {len(l['cotacoes'])}  ·  confiança: {l['confianca']}"):
+        with st.expander(
+            f"Item {l['numero']} — {l['nome']}  ·  ofertas: {len(l['cotacoes'])}  ·  confiança: {l['confianca']}",
+            expanded=not l["cotacoes"],
+        ):
             if l["justificativa"]:
                 st.write(f"**Justificativa da escolha:** {l['justificativa']}")
+            if l["diagnostico"]:
+                st.markdown("**Buscas realizadas**")
+                for d in l["diagnostico"]:
+                    st.write(f"• “{d['consulta']}” → {d['resultados']} resultados" + (f" — ⚠️ {d['erro']}" if d["erro"] else ""))
             if l["cotacoes"]:
+                st.markdown("**Ofertas com preço**")
                 st.dataframe(
                     pd.DataFrame([
                         {"Validada pela IA": q.get("validada", False), "Usada no preço": q.get("usada", False), "Loja": q["loja"],
@@ -833,8 +879,18 @@ if proposta:
                         "Link": st.column_config.LinkColumn(display_text="abrir"),
                     },
                 )
-            else:
-                st.write("Nenhuma oferta com preço foi encontrada para este item.")
+            if l["sem_preco"]:
+                st.markdown("**Páginas encontradas sem preço legível** (abra os links para conferir manualmente)")
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Loja": q["loja"], "Produto": q["titulo"], "Motivo": q["motivo_sem_preco"], "Link": q["url"]}
+                        for q in l["sem_preco"]
+                    ]),
+                    hide_index=True,
+                    column_config={"Link": st.column_config.LinkColumn(display_text="abrir")},
+                )
+            if not l["cotacoes"] and not l["sem_preco"]:
+                st.write("A busca não retornou nenhuma página utilizável para este item.")
 
     anexo = st.checkbox("Incluir no PDF um anexo com a pesquisa de preços (lojas e links)")
     try:
