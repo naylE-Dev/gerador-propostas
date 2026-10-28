@@ -1,12 +1,12 @@
 """
-Gerador de Propostas Comerciais para Licitações (v4 — Multi-LLM + Jina Reader + Multi-Imagens)
-Streamlit + Agentes modulares + Busca DuckDuckGo + Jina Reader (JS/Imagens) + ReportLab
+Gerador de Propostas Comerciais para Licitações (v3 — Otimizado e sem Serper)
+Streamlit + agentes modulares (CrewAI-style) + busca web inteligente (ddgs) + ReportLab
 
 Secrets (Streamlit Cloud > Settings > Secrets):
     LLM_API_KEY        = "sua-chave-gemini"
-    GROQ_API_KEY       = "sua-chave-groq-opcional-para-fallback"
-    OPENAI_API_KEY     = "sua-chave-openai-opcional-para-fallback"
-    JINA_API_KEY       = "sua-chave-jina-reader-opcional"
+    LLM_BASE_URL       = "https://generativelanguage.googleapis.com/v1beta/openai/"   # opcional
+    LLM_MODEL          = "gemini-3.8-flash"                                           # opcional
+    LLM_FALLBACK_MODEL = "gemini-3.5-flash-lite"                                 # opcional
 """
 from __future__ import annotations
 
@@ -50,10 +50,11 @@ except ImportError:
     ZoneInfo = None
 
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-DEFAULT_MODEL = "gemini-2.5-flash"
-PROPOSTA_V = 6                
+DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+PROPOSTA_V = 5                
 MAX_ITENS = 6                 
-MAX_PAGINAS_POR_ITEM = 6      
+MAX_PAGINAS_POR_ITEM = 8      
 NAVY = colors.HexColor("#1F3A5F")
 LIGHT = colors.HexColor("#EEF2F7")
 HEADERS = {
@@ -62,7 +63,7 @@ HEADERS = {
 }
 
 BLOCKED_DOMAINS = ("youtube.com", "wikipedia.org", "facebook.com", "instagram.com", "reddit.com", "pinterest.com",
-                   "tiktok.com", "twitter.com", "x.com", "linkedin.com")
+                   "tiktok.com", "twitter.com", "x.com", "linkedin.com", "mercadolivre.com.br/anuncios", "mercadolivre.com/p/ML")
 SITE_TARGETS = ("mercadolivre.com.br", "kabum.com.br", "magazineluiza.com.br", "amazon.com.br")
 KNOWN_STORES = (
     "mercadolivre", "amazon.com.br", "kabum", "magazineluiza", "magalu", "americanas", "casasbahia", "pontofrio",
@@ -133,7 +134,7 @@ def host_of(url: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Pesquisa Web e Leitura Avançada (Jina Reader API + Fallback)
+# Ferramentas de pesquisa web e extração
 # ----------------------------------------------------------------------------
 def search_web(query: str, n: int = 8) -> list[dict]:
     if DDGS is None:
@@ -169,64 +170,33 @@ def is_public_url(url: str) -> bool:
         return False
 
 
-def fetch_product_jina(url: str, jina_api_key: str = "") -> dict:
-    """Usa o Jina Reader API para renderizar JavaScript e extrair texto, preço e múltiplas imagens."""
-    if not is_public_url(url):
-        return {"preco": None, "imagens": []}
-    
-    jina_url = f"https://r.jina.ai/{url}"
-    headers = {
-        "Accept": "application/json",
-        "X-With-Generated-Alt": "true",
-        "X-Respond-With": "markdown"
-    }
-    if jina_api_key:
-        headers["Authorization"] = f"Bearer {jina_api_key}"
-
+def fetch_html(url: str, max_bytes: int = 1_500_000) -> tuple[str, str]:
     try:
-        r = requests.get(jina_url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            content = data.get("content", "")
-            title = data.get("title", "")
-            images_map = data.get("images", {})
-            
-            # Filtra imagens válidas de produtos
-            photos = [
-                img_url for img_url in images_map.keys()
-                if any(ext in img_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp'])
-                and not any(bad in img_url.lower() for bad in ['logo', 'icon', 'banner', 'avatar', 'footer'])
-            ]
-            
-            # Tenta achar preço no conteúdo markdown renderizado
-            preco = price_from_text(content)
-            return {
-                "titulo": title,
-                "preco": preco,
-                "imagens": photos[:6],
-                "conteudo": content
-            }
-    except Exception:
-        pass
-    return {"preco": None, "imagens": []}
-
-
-_PRICE_RE = re.compile(r"R\$\s?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+(?:,\d{2})?)")
-_BAD_CONTEXT = re.compile(r"frete|cupom|desconto|\boff\b|economi|cashback|parcel|juros|entrada|acima de|taxa", re.I)
-
-
-def price_from_text(text: str) -> float | None:
-    for m in _PRICE_RE.finditer(text):
-        before = text[max(0, m.start() - 30) : m.start()].lower()
-        after = text[m.end() : m.end() + 14].lower()
-        if re.search(r"\d\s*x\s*(de\s*)?$", before) or _BAD_CONTEXT.search(before[-14:] + " " + after):
-            continue
-        if re.match(r"\s*por\b", after):
-            continue
-        p = to_float(m.group(1))
-        if p > 0:
-            return p
-    return None
+        for _ in range(4):
+            if not is_public_url(url):
+                return "", "endereço não permitido"
+            r = requests.get(url, headers=HEADERS, timeout=7, stream=True, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                url = urljoin(url, r.headers.get("location", ""))
+                r.close()
+                continue
+            if r.status_code != 200:
+                code = r.status_code
+                r.close()
+                return "", f"HTTP {code}"
+            if "html" not in r.headers.get("content-type", "").lower():
+                r.close()
+                return "", "não é HTML"
+            data = b""
+            for chunk in r.iter_content(65536):
+                data += chunk
+                if len(data) >= max_bytes:
+                    break
+            r.close()
+            return data.decode(r.encoding or "utf-8", errors="ignore"), "ok"
+        return "", "redirecionamentos excessivos"
+    except Exception as e:
+        return "", f"erro de rede ({type(e).__name__})"
 
 
 def normalize_image(data: bytes) -> bytes | None:
@@ -238,7 +208,7 @@ def normalize_image(data: bytes) -> bytes | None:
             bg = PILImage.new("RGB", im.size, "white")
             bg.paste(im, mask=im.split()[3])
             im = bg
-        im.thumbnail((800, 800))
+        im.thumbnail((700, 700))
         out = io.BytesIO()
         im.save(out, "JPEG", quality=85)
         return out.getvalue()
@@ -246,9 +216,9 @@ def normalize_image(data: bytes) -> bytes | None:
         return None
 
 
-def fetch_image(url: str, max_bytes: int = 4_000_000) -> bytes | None:
+def fetch_image(url: str, max_bytes: int = 3_000_000) -> bytes | None:
     try:
-        for _ in range(3):
+        for _ in range(4):
             if not is_public_url(url):
                 return None
             r = requests.get(url, headers=HEADERS, timeout=8, stream=True, allow_redirects=False)
@@ -272,35 +242,107 @@ def fetch_image(url: str, max_bytes: int = 4_000_000) -> bytes | None:
     return None
 
 
-def enrich_result(r: dict, jina_key: str = "") -> dict:
+def first_image(urls: list[str]) -> tuple[bytes | None, str]:
+    for u in urls:
+        img = fetch_image(u)
+        if img:
+            return img, u
+    return None, ""
+
+
+_LD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
+_OG_IMG_RE = re.compile(r'<meta[^>]+(?:property|name)=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+_PRICE_RE = re.compile(r"R\$\s?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+(?:,\d{2})?)")
+
+
+def _walk(node):
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk(v)
+
+
+def _ld_price(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return to_float(v)
+
+
+def parse_product_page(html: str) -> dict:
+    info: dict = {}
+    for m in _LD_RE.finditer(html):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        for node in _walk(data):
+            offers = node.get("offers")
+            if not offers:
+                continue
+            prices = []
+            for o in offers if isinstance(offers, list) else [offers]:
+                if isinstance(o, dict) and str(o.get("priceCurrency") or "BRL").upper() == "BRL":
+                    p = _ld_price(o.get("price") or o.get("lowPrice"))
+                    if p > 0:
+                        prices.append(p)
+            if prices:
+                info["preco"] = min(prices)
+                info["nome"] = str(node.get("name") or "")
+                rt = node.get("aggregateRating")
+                if isinstance(rt, dict):
+                    info["nota"] = to_float(rt.get("ratingValue"), 0.0) or None
+                    info["n"] = int(to_float(rt.get("reviewCount") or rt.get("ratingCount"), 0)) or None
+                return info
+    return info
+
+
+_BAD_CONTEXT = re.compile(r"frete|cupom|desconto|\boff\b|economi|cashback|parcel|juros|entrada|acima de|taxa", re.I)
+
+
+def price_from_text(text: str) -> float | None:
+    for m in _PRICE_RE.finditer(text):
+        before = text[max(0, m.start() - 30) : m.start()].lower()
+        after = text[m.end() : m.end() + 14].lower()
+        if re.search(r"\d\s*x\s*(de\s*)?$", before) or _BAD_CONTEXT.search(before[-14:] + " " + after):
+            continue
+        if re.match(r"\s*por\b", after):
+            continue
+        p = to_float(m.group(1))
+        if p > 0:
+            return p
+    return None
+
+
+def enrich_result(r: dict) -> dict:
     url, host = r.get("href", ""), host_of(r.get("href", ""))
-    
-    # Tenta leitura inteligente via Jina Reader
-    jina_data = fetch_product_jina(url, jina_key)
-    preco = jina_data.get("preco")
-    imagens = jina_data.get("imagens", [])
-    titulo = jina_data.get("titulo") or r.get("title", "")
-    
-    origem = "Jina Reader (JS/Web)" if preco else None
-    
-    # Fallback para trecho de busca simples se o Jina não achou preço
+    html, status = fetch_html(url)
+    try:
+        info = parse_product_page(html) if html else {}
+    except Exception:
+        info = {}
+    preco = info.get("preco")
+    origem = "página do produto (schema)" if preco else None
     if not preco:
         preco = price_from_text(f"{r.get('title', '')} {r.get('body', '')}")
         origem = "trecho da busca" if preco else None
-
     if preco and not (1 <= preco <= 5_000_000):
         preco = None
-
-    motivo = "" if preco else "sem preço legível na página"
+    motivo = "" if preco else (f"sem preço legível ({status})" if html else f"falha na leitura: {status}")
+    og = _OG_IMG_RE.search(html) if html else None
     return {
-        "imagem_url": imagens[0] if imagens else "",
-        "imagens_extras": imagens,
-        "titulo": titulo[:160],
+        "imagem_url": urljoin(url, og.group(1)) if og else "",
+        "titulo": (info.get("nome") or r.get("title") or "")[:160],
         "url": url,
         "loja": host,
         "loja_conhecida": _known_store(host),
         "preco": preco,
         "origem": origem,
+        "nota": info.get("nota"),
+        "n_avaliacoes": info.get("n"),
         "motivo_sem_preco": motivo,
     }
 
@@ -309,7 +351,7 @@ def _is_blocked(host: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
 
 
-def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_step=lambda m: None, jina_key: str = ""):
+def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_step=lambda m: None):
     cands = {i: [] for i in queries_by_item}
     sem_preco = {i: [] for i in queries_by_item}
     logs = {i: [] for i in queries_by_item}
@@ -330,17 +372,17 @@ def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_
                     avisos.append(str(e))
                     logs[i].append({"consulta": q, "resultados": 0, "erro": str(e)})
                     continue
-                for res in results:
-                    url, host = res.get("href") or "", host_of(res.get("href") or "")
+                for r in results:
+                    url, host = r.get("href") or "", host_of(r.get("href") or "")
                     if url and url not in seen[i] and not _is_blocked(host):
                         seen[i].add(url)
-                        found[i].append(res)
-                time.sleep(0.5)
+                        found[i].append(r)
+                time.sleep(0.6)
             found[i] = found[i][:MAX_PAGINAS_POR_ITEM]
         
-        on_step("🛒 Navegando nas lojas e extraindo preços com renderização avançada...")
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futures = [(i, ex.submit(enrich_result, res, jina_key)) for i, rs in found.items() for res in rs]
+        on_step("🛒 Lendo páginas das lojas e extraindo preços...")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [(i, ex.submit(enrich_result, r)) for i, rs in found.items() for r in rs]
             for i, f in futures:
                 try:
                     c = f.result()
@@ -354,59 +396,82 @@ def collect_quotes(queries_by_item: dict[int, list[str]], avisos: list[str], on_
 
     run_phase(queries_by_item)
     
+    # Tentativa de recuperação em grandes sites se faltarem ofertas
     retry = {i: [f"{queries_by_item[i][0]} site:{d}" for d in SITE_TARGETS] for i in queries_by_item if not cands[i] and queries_by_item[i]}
     if retry:
-        on_step("🔁 Buscando diretamente em grandes marketplaces...")
+        on_step("🔁 Buscando diretamente em grandes varejistas parceiros...")
         run_phase(retry)
         
     return cands, sem_preco, logs
 
 
+NON_TEXT_MODEL_HINTS = ("tts", "live", "image", "embedding", "transcribe", "robotics", "computer-use", "audio",
+                        "omni", "translate", "veo", "imagen", "lyria", "banana", "antigravity", "deep-research")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_gemini_models(api_key: str, base_url: str) -> list[str]:
+    try:
+        ids = [m.id.removeprefix("models/") for m in OpenAI(api_key=api_key, base_url=base_url, max_retries=1, timeout=20).models.list()]
+    except Exception:
+        return []
+    return sorted({i for i in ids if i.startswith("gemini") and not any(h in i for h in NON_TEXT_MODEL_HINTS)})
+
+
+def _flash_version(name: str):
+    m = re.fullmatch(r"gemini-(\d+(?:\.\d+)*)-flash(-lite)?", name)
+    return (tuple(int(x) for x in m.group(1).split(".")), bool(m.group(2))) if m else None
+
+
+def pick_defaults(models: list[str], want: str, want_fallback: str) -> tuple[str, str]:
+    flash = sorted((m for m in models if (v := _flash_version(m)) and not v[1]), key=lambda m: _flash_version(m)[0], reverse=True)
+    lite = sorted((m for m in models if (v := _flash_version(m)) and v[1]), key=lambda m: _flash_version(m)[0], reverse=True)
+    main = want if want in models else (flash[0] if flash else models[0])
+    fb = want_fallback if want_fallback in models else (lite[0] if lite else next((m for m in flash if m != main), main))
+    return main, fb
+
+
 # ----------------------------------------------------------------------------
-# Camada Multi-LLM com Fallback Automático (Gemini, Groq, OpenAI)
+# Camada de LLM e Agentes
 # ----------------------------------------------------------------------------
-class MultiProviderLLM:
-    """Gerencia múltiplos provedores e chaves de IA com failover automático."""
-    def __init__(self, providers: list[dict]):
-        self.providers = [p for p in providers if p.get("api_key")]
+RETRY_WAITS = (3, 8, 16)
+
+
+class LLM:
+    def __init__(self, api_key: str, base_url: str, model: str, fallback_model: str = ""):
+        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=1, timeout=90)
+        self.models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
+
+    def _create(self, model: str, system: str, user: str):
+        return self.client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
 
     def _complete(self, system: str, user: str) -> str:
-        if not self.providers:
-            raise RuntimeError("Nenhuma chave de API de IA foi configurada. Insira ao menos a chave do Gemini.")
-        
-        last_error = None
-        for prov in self.providers:
-            try:
-                client = OpenAI(
-                    api_key=prov["api_key"],
-                    base_url=prov.get("base_url"),
-                    timeout=60,
-                    max_retries=1
-                )
-                res = client.chat.completions.create(
-                    model=prov["model"],
-                    temperature=0.2,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user}
-                    ]
-                )
-                return res.choices[0].message.content or ""
-            except Exception as e:
-                last_error = e
-                continue # Tenta o próximo provedor na lista de backup
-                
-        raise RuntimeError(f"Todos os provedores de IA falharam. Último erro: {last_error}")
+        last: Exception | None = None
+        for model in self.models:
+            for attempt in range(len(RETRY_WAITS) + 1):
+                try:
+                    return self._create(model, system, user).choices[0].message.content or ""
+                except (openai.RateLimitError, openai.InternalServerError, openai.APIConnectionError) as e:
+                    last = e
+                    if attempt < len(RETRY_WAITS):
+                        time.sleep(RETRY_WAITS[attempt])
+                except (openai.NotFoundError, openai.PermissionDeniedError) as e:
+                    last = e
+                    break
+        raise RuntimeError(f"O serviço da IA está sobrecarregado ou indisponível no momento: {last}")
 
     def json_call(self, system: str, user: str, retries: int = 2) -> dict:
-        last_error = None
+        last_error: Exception | None = None
         for _ in range(retries + 1):
             try:
-                text = self._complete(system, user)
-                return extract_json(text)
+                return extract_json(self._complete(system, user))
             except (ValueError, json.JSONDecodeError) as e:
                 last_error = e
-        raise RuntimeError(f"A IA respondeu em formato inválido: {last_error}")
+        raise RuntimeError(f"Resposta da IA em formato inválido: {last_error}")
 
 
 @dataclass
@@ -414,7 +479,7 @@ class Agent:
     role: str
     goal: str
     backstory: str
-    llm: MultiProviderLLM
+    llm: LLM
 
     def run(self, task: str) -> dict:
         system = (
@@ -430,11 +495,11 @@ SCHEMA_VAL = '{"validacoes":[{"indice":0,"validos":["id","id"],"recomendado":"id
 SCHEMA_RED = '{"apresentacao":"","itens":[{"indice":0,"descricao_proposta":"","especificacoes":[""]}],"condicoes":{"validade_dias":60,"prazo_entrega":"","garantia":"","pagamento":""}}'
 
 
-def run_pipeline(llm: MultiProviderLLM, edital: str, empresa: dict, on_step=lambda msg: None, jina_key: str = "") -> dict:
+def run_pipeline(llm: LLM, edital: str, empresa: dict, on_step=lambda msg: None) -> dict:
     avisos: list[str] = []
 
     # Agente 1: Analista de Requisitos
-    on_step("🔎 Analisando requisitos do edital...")
+    on_step("🔎 Analisando requisitos e itens do edital...")
     analista = Agent(
         "Analista de Requisitos de Licitações",
         "extrair do edital os itens e especificações com precisão",
@@ -479,10 +544,10 @@ def run_pipeline(llm: MultiProviderLLM, edital: str, empresa: dict, on_step=lamb
         if not queries[i]:
             queries[i] = [f"{it.get('nome_produto', '')} comprar preço"]
 
-    cands, sem_preco, logs = collect_quotes(queries, avisos, on_step, jina_key)
+    cands, sem_preco, logs = collect_quotes(queries, avisos, on_step)
     pesquisa_em = now_br().strftime("%d/%m/%Y %H:%M")
 
-    # Filtro de sanidade
+    # Filtro de sanidade de preços
     for i, cs in cands.items():
         fx = faixas.get(i)
         for c in cs:
@@ -493,7 +558,7 @@ def run_pipeline(llm: MultiProviderLLM, edital: str, empresa: dict, on_step=lamb
         {
             "indice": i,
             "item": itens[i].get("nome_produto"),
-            "ofertas": [{k: c[k] for k in ("id", "titulo", "loja", "loja_conhecida", "preco", "origem")} for c in cs if not c["implausivel"]]
+            "ofertas": [{k: c[k] for k in ("id", "titulo", "loja", "loja_conhecida", "preco", "origem", "nota", "n_avaliacoes")} for c in cs if not c["implausivel"]]
         }
         for i, cs in cands.items() if any(not c["implausivel"] for c in cs)
     ]
@@ -530,15 +595,7 @@ def run_pipeline(llm: MultiProviderLLM, edital: str, empresa: dict, on_step=lamb
             for c in usadas:
                 c["usada"] = True
             melhor = by_id[rec] if rec in valid_ids else min(usadas, key=lambda c: c["preco"])
-            
-            # Coleta lista de imagens candidatas (juntando imagem principal e extras encontradas)
-            all_imgs = []
-            if melhor.get("imagem_url"):
-                all_imgs.append(melhor.get("imagem_url"))
-            for u_c in sorted(usadas, key=lambda x: x["preco"]):
-                all_imgs.extend(u_c.get("imagens_extras", []))
-            img_urls = list(dict.fromkeys(all_imgs))[:5]
-
+            img_urls = list(dict.fromkeys(c.get("imagem_url") for c in [melhor] + sorted(usadas, key=lambda c: c["preco"]) if c.get("imagem_url")))[:3]
             precos = [c["preco"] for c in usadas]
             preco, faixa, ref = melhor["preco"], (min(precos), max(precos)), melhor["titulo"]
             confianca = "baixa (provisória)" if provisorio else ("alta" if len(usadas) >= 2 else "média")
@@ -561,33 +618,21 @@ def run_pipeline(llm: MultiProviderLLM, edital: str, empresa: dict, on_step=lamb
             "produto_referencia": ref,
             "cotacoes": cs,
             "sem_preco": sem_preco.get(i, []),
+            "faixa_plausivel": faixas.get(i),
             "imagem_candidatas": img_urls,
             "imagem_auto": None,
-            "imagens_galeria": [],
             "diagnostico": logs.get(i, []),
             "confianca": confianca,
             "justificativa": str(v.get("justificativa") or ""),
         })
 
-    # Download automático das fotos encontradas
     if any(l["imagem_candidatas"] for l in linhas):
-        on_step("🖼️ Baixando galeria de imagens dos produtos...")
+        on_step("🖼️ Baixando imagens dos produtos...")
         with ThreadPoolExecutor(max_workers=4) as ex:
-            def download_all_for_line(l):
-                downloaded = []
-                for u in l["imagem_candidatas"]:
-                    img_bytes = fetch_image(u)
-                    if img_bytes:
-                        downloaded.append(img_bytes)
-                return downloaded
-
-            futs = [(l, ex.submit(download_all_for_line, l)) for l in linhas if l["imagem_candidatas"]]
+            futs = [(l, ex.submit(first_image, l["imagem_candidatas"])) for l in linhas if l["imagem_candidatas"]]
             for l, f in futs:
                 try:
-                    imgs = f.result()
-                    if imgs:
-                        l["imagem_auto"] = imgs[0]
-                        l["imagens_galeria"] = imgs # Salva todas as fotos para o usuário escolher se quiser
+                    l["imagem_auto"] = f.result()[0]
                 except Exception:
                     pass
 
@@ -637,7 +682,7 @@ def recalc(p: dict) -> None:
 
 
 # ----------------------------------------------------------------------------
-# Geração de PDF (ReportLab) com suporte a Múltiplas Imagens
+# Geração de PDF (ReportLab)
 # ----------------------------------------------------------------------------
 def build_pdf(p: dict, anexo: bool = False) -> bytes:
     emp = p["empresa"]
@@ -683,7 +728,7 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
             P(l["numero"], center), P(f"{l['nome']}\n{l['descricao_proposta']}"), P(l["unidade"], center),
             P(fmt_qtd(l["quantidade"]), center), P(brl(l["preco_unitario"]), right), P(brl(l["subtotal"]), right),
         ])
-    rows.append([P("VALOR TOTAL DA PROPOSTA", bold_r), "", "", "", "", P(brl(p["total"], bold_r))])
+    rows.append([P("VALOR TOTAL DA PROPOSTA", bold_r), "", "", "", "", P(brl(p["total"]), bold_r)])
     it = Table(rows, colWidths=[1.3 * cm, 6.7 * cm, 1.3 * cm, 1.7 * cm, 3.0 * cm, 3.0 * cm], repeatRows=1)
     it.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey),
@@ -692,32 +737,25 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
     ]))
     story.append(it)
 
-    story.append(P("4. Especificações técnicas e ilustrações", h2))
+    story.append(P("4. Especificações técnicas", h2))
     cap = ParagraphStyle("cap", parent=base, fontSize=7.5, leading=9, alignment=TA_CENTER, textColor=colors.grey)
     for l in p["linhas"]:
         story.append(P(f"Item {l['numero']} — {l['nome']}", ParagraphStyle("b", parent=base, fontName="Helvetica-Bold", spaceBefore=4, spaceAfter=2)))
         bullets = [Paragraph(escape(s), bullet, bulletText="•") for s in (l["especificacoes_finais"] or ["Conforme edital."])]
-        
-        # Suporta exibir até 2 imagens principais se o usuário selecionou
-        imagens_para_pdf = l.get("imagens_selecionadas", [])
         placed = False
-        
-        if imagens_para_pdf and len(bullets) <= 25:
+        if l.get("imagem") and len(bullets) <= 25:
             try:
-                img_cells = []
-                for img_data in imagens_para_pdf[:2]:
-                    w, h = PILImage.open(io.BytesIO(img_data)).size
-                    s = min(3.5 * cm / w, 3.5 * cm / h)
-                    img_cells.append(RLImage(io.BytesIO(img_data), width=w * s, height=h * s))
-                
-                cell_table = Table([[img] for img in img_cells], colWidths=[4.0 * cm])
-                tb = Table([[bullets, cell_table]], colWidths=[13.0 * cm, 4.0 * cm])
-                tb.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+                w, h = PILImage.open(io.BytesIO(l["imagem"])).size
+                s = min(4.2 * cm / w, 4.2 * cm / h)
+                cell = [RLImage(io.BytesIO(l["imagem"]), width=w * s, height=h * s)]
+                if l.get("imagem_legenda"):
+                    cell.append(P(l["imagem_legenda"], cap))
+                tb = Table([[bullets, cell]], colWidths=[12.6 * cm, 4.4 * cm])
+                tb.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
                 story.append(tb)
                 placed = True
             except Exception:
                 placed = False
-                
         if not placed:
             story += bullets
 
@@ -782,48 +820,42 @@ with st.sidebar:
         "cidade": st.text_input("Cidade"),
         "edital": st.text_input("Edital / Pregão nº"),
     }
-    
-    st.divider()
-    st.header("⚙️ Provedores de IA & APIs")
-    
-    # Primária (Gemini)
-    api_key_gemini = get_secret("LLM_API_KEY")
-    api_key = st.text_input("Chave Gemini (Principal)", type="password", value=api_key_gemini)
-    
-    # Reservas / Fallback (Groq ou OpenAI)
-    with st.expander("Chaves de Contingência (Backup)"):
-        groq_key = st.text_input("Chave Groq (Backup 1)", type="password", value=get_secret("GROQ_API_KEY"), help="Crie em console.groq.com (muito rápido e gratuito)")
-        openai_key = st.text_input("Chave OpenAI (Backup 2)", type="password", value=get_secret("OPENAI_API_KEY"))
-        jina_key = st.text_input("Chave Jina Reader (Opcional)", type="password", value=get_secret("JINA_API_KEY"), help="Melhora extração em e-commerces difíceis (jina.ai)")
+    with st.expander("⚙️ Configuração da IA"):
+        api_key = get_secret("LLM_API_KEY")
+        if api_key:
+            st.success("Chave de API carregada dos Secrets.")
+        else:
+            api_key = st.text_input("Chave de API (Gemini)", type="password")
+        base_url = st.text_input("Base URL", value=get_secret("LLM_BASE_URL", DEFAULT_BASE_URL))
+        want, want_fb = get_secret("LLM_MODEL", DEFAULT_MODEL), get_secret("LLM_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
+        disponiveis = list_gemini_models(api_key, base_url) if api_key else []
+        if disponiveis:
+            d_main, d_fb = pick_defaults(disponiveis, want, want_fb)
+            model = st.selectbox("Modelo", disponiveis, index=disponiveis.index(d_main))
+            fallback_model = st.selectbox("Modelo reserva", disponiveis, index=disponiveis.index(d_fb))
+        else:
+            model = st.text_input("Modelo", value=want)
+            fallback_model = st.text_input("Modelo reserva", value=want_fb)
 
-st.title("📄 Gerador de Propostas para Licitações com Multi-LLM")
-st.caption("Agentes autônomos com suporte a fallback de IAs, renderização web via Jina Reader e galerias de imagens.")
+st.title("📄 Gerador de Propostas para Licitações")
+st.caption("Cole a especificação do edital: os agentes pesquisam preços reais na web e geram a proposta em PDF.")
 
 edital_text = st.text_area(
-    "Especificação do produto (texto bruto do edital)", height=240,
-    placeholder="Ex.: Item 1 — Notebook i7, 16GB RAM, SSD 512GB. Qtd: 10.",
+    "Especificação do produto (texto bruto do edital)", height=260,
+    placeholder="Ex.: Item 1 — Notebook, processador mínimo 8 núcleos, 16 GB RAM, SSD 512 GB, tela 15,6\". Quantidade: 20 unidades.",
 )
 
 if st.button("Gerar Proposta Comercial", type="primary"):
     if not edital_text.strip():
         st.warning("Cole a especificação do edital antes de gerar.")
-    elif not api_key and not groq_key and not openai_key:
-        st.warning("Informe pelo menos uma chave de API de IA (Gemini ou Groq) na barra lateral.")
+    elif not api_key:
+        st.warning("Informe a chave de API na barra lateral (ou nos Secrets).")
     else:
         try:
-            with st.spinner("Os agentes estão pesquisando na web e processando os dados..."):
+            with st.spinner("Os agentes estão trabalhando (a pesquisa web pode levar alguns instantes)..."):
                 status = st.empty()
-                
-                # Configura a lista de provedores para o MultiProviderLLM
-                providers_config = [
-                    {"name": "Gemini", "api_key": api_key, "base_url": DEFAULT_BASE_URL, "model": DEFAULT_MODEL},
-                    {"name": "Groq", "api_key": groq_key, "base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile"},
-                    {"name": "OpenAI", "api_key": openai_key, "base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"}
-                ]
-                multi_llm = MultiProviderLLM(providers_config)
-                
                 st.session_state["proposta"] = run_pipeline(
-                    multi_llm, edital_text.strip(), empresa, on_step=status.info, jina_key=jina_key
+                    LLM(api_key, base_url, model, fallback_model), edital_text.strip(), empresa, on_step=status.info
                 )
                 st.session_state["gen_id"] += 1
                 status.empty()
@@ -839,7 +871,7 @@ if proposta and proposta.get("_v") != PROPOSTA_V:
 
 if proposta:
     st.divider()
-    st.subheader("Revise os valores e selecione as imagens")
+    st.subheader("Revise os valores e itens")
     for aviso in proposta["avisos"]:
         st.warning(aviso)
         
@@ -871,43 +903,29 @@ if proposta:
     for l in final["linhas"]:
         with st.expander(f"Item {l['numero']} — {l['nome']}  ·  ofertas: {len(l['cotacoes'])}  ·  confiança: {l['confianca']}", expanded=not l["cotacoes"]):
             gid = f"{st.session_state['gen_id']}_{l['numero']}"
-            
-            # Galeria de fotos encontradas e opção de escolha
-            imagens_escolhidas = []
-            galeria = l.get("imagens_galeria", [])
-            
-            if galeria:
-                st.markdown(f"**Galeria de imagens encontradas ({len(galeria)} fotos):**")
-                cols = st.columns(min(len(galeria), 4))
-                for idx, img_bytes in enumerate(galeria):
-                    with cols[idx % 4]:
-                        st.image(img_bytes, width=120)
-                        if st.checkbox(f"Usar foto {idx+1}", value=(idx < 2), key=f"img_chk_{gid}_{idx}"):
-                            imagens_escolhidas.append(img_bytes)
-            else:
-                st.caption("Nenhuma foto automática extraída para este item.")
-                
-            up = st.file_uploader(f"Enviar imagem própria para o Item {l['numero']}", type=["png", "jpg", "jpeg", "webp"], key=f"up_{gid}")
+            img = None
+            up = st.file_uploader("Enviar imagem própria (PNG, JPG, WEBP)", type=["png", "jpg", "jpeg", "webp"], key=f"up_{gid}")
             if up is not None:
-                img_norm = normalize_image(up.getvalue())
-                if img_norm:
-                    imagens_escolhidas.insert(0, img_norm)
-                    st.success("Imagem enviada com sucesso!")
-
-            l["imagens_selecionadas"] = imagens_escolhidas if incluir_imagens else []
-
+                img = normalize_image(up.getvalue())
+            elif l.get("imagem_auto"):
+                if st.checkbox("Usar imagem ilustrativa encontrada", value=True, key=f"auto_{gid}"):
+                    img = l["imagem_auto"]
+            if img:
+                st.image(img, width=180)
+            l["imagem"], l["imagem_legenda"] = (img, "Imagem ilustrativa") if incluir_imagens else (None, "")
+            
             if l["cotacoes"]:
-                st.markdown("**Ofertas encontradas na web**")
+                st.markdown("**Ofertas encontradas**")
                 st.dataframe(
                     pd.DataFrame([
-                        {"Usada": q.get("validada", True), "Loja": q["loja"], "Produto": q["titulo"], "Preço": q["preco"], "Origem": q.get("origem"), "Link": q["url"]}
+                        {"Usada": q.get("usada", False), "Loja": q["loja"], "Produto": q["titulo"], "Preço": q["preco"], "Link": q["url"]}
                         for q in l["cotacoes"]
                     ]),
                     hide_index=True,
                     column_config={"Preço": st.column_config.NumberColumn(format="R$ %.2f"), "Link": st.column_config.LinkColumn(display_text="abrir")},
                 )
 
-    anexo = st.checkbox("Incluir anexo com a pesquisa de preços detalhada e links no PDF")
+    anexo = st.checkbox("Incluir anexo com a pesquisa de preços e links no PDF")
     try:
         st.download_button(
             "⬇️ Baixar proposta em PDF", data=build_pdf(final, anexo), mime="application/pdf",
