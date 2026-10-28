@@ -1,7 +1,8 @@
-streamlit>=1.40
-openai>=1.50
+streamlit>=1.32,<2
+openai>=1.30,<2
 reportlab>=4.0
 pandas>=2.0
 requests>=2.31
-ddgs>=9.0
+ddgs>=6.0
 pillow>=10.0
+beautifulsoup4>=4.12
