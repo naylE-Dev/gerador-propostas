@@ -1,5 +1,5 @@
 """
-Gerador de Propostas Comerciais para Licitações (v5 — Cache-bust + multi-imagem)
+Gerador de Propostas Comerciais para Licitações (v6 — Otimizado e Corrigido)
 Streamlit + agentes modulares + busca web inteligente (ddgs) + ReportLab
 
 Secrets:
@@ -66,7 +66,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------------
-PROPOSTA_V = 7              # bumped — invalida estado antigo
+PROPOSTA_V = 8
 MAX_ITENS = 6
 MAX_PAGINAS_POR_ITEM = 8
 MAX_IMAGENS_POR_ITEM = 6
@@ -92,7 +92,7 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
-RETRY_WAITS = (2, 5)         # reduzido (era 2,5,10)
+RETRY_WAITS = (2, 4)
 
 BLOCKED_DOMAINS = (
     "youtube.com", "wikipedia.org", "facebook.com", "instagram.com",
@@ -225,7 +225,7 @@ def parse_models(s: str) -> list[str]:
 
 
 # ----------------------------------------------------------------------------
-# Busca web (DuckDuckGo) — retry enxuto + circuit breaker feito no collect
+# Busca web (DuckDuckGo)
 # ----------------------------------------------------------------------------
 def search_web(query: str, n: int = 8) -> list[dict]:
     if DDGS is None:
@@ -258,7 +258,7 @@ def is_public_url(url: str) -> bool:
         u = urlparse(url)
         if u.scheme not in ("http", "https") or not u.hostname:
             return False
-        for info in socket.getaddrinfo(u.hostname, None):
+        for info in socket.getaddrinfo(u.hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
             ip = ipaddress.ip_address(info[4][0])
             if (ip.is_private or ip.is_loopback or ip.is_link_local
                     or ip.is_reserved or ip.is_multicast):
@@ -269,7 +269,7 @@ def is_public_url(url: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# HTTP / Jina — ambos com cache-bust
+# HTTP / Jina
 # ----------------------------------------------------------------------------
 def fetch_html(url: str, max_bytes: int = 1_500_000) -> tuple[str, str]:
     try:
@@ -688,7 +688,7 @@ class MultiProviderLLM:
                 try:
                     resp = client.chat.completions.create(
                         model=model,
-                        temperature=0.4,                    # leve variação
+                        temperature=0.4,
                         messages=[
                             {"role": "system", "content": system},
                             {"role": "user", "content": user},
@@ -925,7 +925,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             "imagem_bytes": [],
             "imagem_thumb": [],
             "imagem_auto": None,
-            "imagens_list": [],           # seleção final (multi)
+            "imagens_list": [],
             "imagem_legenda": "",
             "diagnostico": logs.get(i, []),
             "confianca": confianca,
@@ -1051,7 +1051,6 @@ def _pdf_signature(p: dict, anexo: bool) -> str:
             h.update(str(s).encode("utf-8", "ignore"))
         for img in l.get("imagens_list") or []:
             h.update(_hashlib.md5(img).digest())
-        # legado
         if l.get("imagem"):
             h.update(_hashlib.md5(l["imagem"]).digest())
     return h.hexdigest()
@@ -1263,7 +1262,7 @@ with st.sidebar:
 
     with st.expander("🤖 Provedores de IA (fallback automático)", expanded=True):
         st.caption(
-            "A chamada tenta primeiro o Provedor 1; se falhar (cota, timeout, chave inválida), "
+            "A chamada tenta primeiro o Provedor 1; se falhar, "
             "cai para o 2 e depois para o 3 — sem interromper a geração."
         )
 
@@ -1323,7 +1322,6 @@ with st.sidebar:
         _reset_proposal_state()
         st.rerun()
 
-# Monta lista de provedores
 providers: list[ProviderConfig] = []
 g_models = parse_models(g_models_str)
 if g_key and g_models:
@@ -1337,8 +1335,6 @@ if oa_key and oa_models:
 
 st.title("📄 Gerador de Propostas para Licitações")
 st.caption("Cole a especificação do edital: os agentes pesquisam preços reais na web e geram a proposta em PDF.")
-st.caption("💡 Cada geração faz uma pesquisa nova (seed aleatório). "
-           "Se desconfiar de resultados antigos, abra o painel “Consultas executadas” abaixo.")
 
 edital_text = st.text_area(
     "Especificação do produto (texto bruto do edital)", height=260,
@@ -1354,7 +1350,6 @@ if st.button("Gerar Proposta Comercial", type="primary"):
     elif not providers:
         st.warning("Informe ao menos uma chave de API na barra lateral (ou nos Secrets).")
     else:
-        # Defensivo: descarta QUALQUER estado da geração anterior
         _reset_proposal_state()
         llm = MultiProviderLLM(providers)
         run_seed = uuid.uuid4().hex[:8]
@@ -1403,11 +1398,6 @@ if proposta:
         st.warning(aviso)
 
     with st.expander("🔍 Consultas efetivamente executadas (verificação)"):
-        st.caption(
-            "Estes são os termos e quantidades que **realmente** foram enviados ao buscador "
-            "nesta execução. Se aparecer algo que não tem a ver com o edital, o problema é a "
-            "interpretação da IA (edital ambíguo) — não cache."
-        )
         for l in proposta["linhas"]:
             st.markdown(f"**Item {l['numero']} — {l['nome']}**")
             for d in l.get("diagnostico", []):
@@ -1433,9 +1423,10 @@ if proposta:
     )
 
     final = copy.deepcopy(proposta)
-    for l, (_, row) in zip(final["linhas"], edited.iterrows()):
-        l["quantidade"] = to_float(row["Qtd"], l["quantidade"])
-        l["preco_unitario"] = to_float(row["Preço unitário"], l["preco_unitario"])
+    for idx, row in edited.iterrows():
+        if idx < len(final["linhas"]):
+            final["linhas"][idx]["quantidade"] = to_float(row["Qtd"], final["linhas"][idx]["quantidade"])
+            final["linhas"][idx]["preco_unitario"] = to_float(row["Preço unitário"], final["linhas"][idx]["preco_unitario"])
     recalc(final)
 
     st.metric("Valor total da proposta", brl(final["total"]))
@@ -1486,7 +1477,7 @@ if proposta:
 
             l["imagens_list"] = chosen_full if incluir_imagens else []
             l["imagem_legenda"] = "Imagem ilustrativa" if l["imagens_list"] else ""
-            l["imagem"] = None  # legado: não usar mais
+            l["imagem"] = None
 
             if l["cotacoes"]:
                 st.markdown("**Ofertas encontradas**")
