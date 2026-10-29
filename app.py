@@ -1,5 +1,5 @@
 """
-Gerador de Propostas Comerciais para Licitações (v6 — Otimizado e Corrigido)
+Gerador de Propostas Comerciais para Licitações (v7 — com persistência, detecção de esgotado e requisitos parciais)
 Streamlit + agentes modulares + busca web inteligente (ddgs) + ReportLab
 
 Secrets:
@@ -43,6 +43,13 @@ from reportlab.platypus import (
     Image as RLImage, KeepTogether, PageBreak, Paragraph,
     SimpleDocTemplate, Spacer, Table, TableStyle,
 )
+
+# ---------- persistência de dados do proponente (cookies) ----------
+try:
+    import st_cookie
+    HAS_ST_COOKIE = True
+except ImportError:
+    HAS_ST_COOKIE = False
 
 try:
     from bs4 import BeautifulSoup
@@ -106,6 +113,17 @@ KNOWN_STORES = (
     "terabyteshop", "pichau", "dell.com", "lenovo.com", "submarino",
     "shoptime", "leroymerlin", "kalunga", "extra.com", "havan",
     "samsung.com", "hp.com", "ferreiracosta", "telhanorte",
+)
+
+# ---------- padrões de “esgotado” ----------
+OUT_OF_STOCK_PATTERNS = [
+    r"esgotado", r"fora de estoque", r"indisponível", r"out of stock",
+    r"sold out", r"notify me", r"avise-me", r"waitlist", r"indisponivel",
+    r"temporariamente indisponível", r"sem estoque", r"produto esgotado",
+]
+OUT_OF_STOCK_BUTTON_RE = re.compile(
+    r'<button[^>]*disabled[^>]*>.*?(comprar|adicionar|buy|add to cart|comprar agora)',
+    re.I | re.S,
 )
 
 # ----------------------------------------------------------------------------
@@ -222,6 +240,24 @@ def host_of(url: str) -> str:
 
 def parse_models(s: str) -> list[str]:
     return [m.strip() for m in (s or "").split(",") if m.strip()]
+
+
+# ----------------------------------------------------------------------------
+# Detecção de “esgotado”
+# ----------------------------------------------------------------------------
+def is_out_of_stock(html: str, text: str = "") -> bool:
+    """Retorna True se a página apresentar sinais de produto esgotado."""
+    combined = (html or "") + " " + (text or "")
+    combined_lower = combined.lower()
+
+    for pat in OUT_OF_STOCK_PATTERNS:
+        if re.search(pat, combined_lower, re.I):
+            return True
+
+    if OUT_OF_STOCK_BUTTON_RE.search(html or ""):
+        return True
+
+    return False
 
 
 # ----------------------------------------------------------------------------
@@ -562,6 +598,9 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
 
     motivo = "" if preco else (f"sem preço legível ({status})" if html else f"falha na leitura: {status}")
 
+    # ---------- detecção de esgotado ----------
+    esgotado = is_out_of_stock(html or "", "")
+
     return {
         "imagens": imgs,
         "titulo": (info.get("nome") or r.get("title") or "")[:160],
@@ -573,6 +612,7 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
         "nota": info.get("nota"),
         "n_avaliacoes": info.get("n"),
         "motivo_sem_preco": motivo,
+        "esgotado": esgotado,
     }
 
 
@@ -779,6 +819,7 @@ SCHEMA_QRY = (
 )
 SCHEMA_VAL = (
     '{"validacoes":[{"indice":0,"validos":["id","id"],"recomendado":"id ou null",'
+    '"requisitos_nao_atendidos":["id:req1, req2"],'
     '"descartados":[{"id":"","motivo":""}],"descricao_comercial":"","justificativa":""}]}'
 )
 SCHEMA_RED = (
@@ -862,7 +903,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             "ofertas": [
                 {k: c[k] for k in (
                     "id", "titulo", "loja", "loja_conhecida", "preco",
-                    "origem", "nota", "n_avaliacoes",
+                    "origem", "nota", "n_avaliacoes", "esgotado",
                 )}
                 for c in cs if not c["implausivel"]
             ],
@@ -872,9 +913,11 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
     if payload:
         on_step("🧪 Validando ofertas e selecionando melhor custo-benefício...")
         val = pesquisador.run(
-            "Selecione em 'validos' os ids das ofertas compatíveis com o produto. "
+            "Selecione em 'validos' os ids das ofertas compatíveis com o produto, "
+            "permitindo até 3 requisitos não atendidos. "
             "Priorize menor preço em lojas confiáveis (loja_conhecida=true). "
-            "Indique a melhor em 'recomendado'.\n"
+            "Indique a melhor em 'recomendado'. "
+            "Para ofertas com requisitos não atendidos, liste-os em 'requisitos_nao_atendidos'.\n"
             f"Formato JSON esperado: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
         )
         validacoes = {int(to_float(v.get("indice"), -1)): v for v in val.get("validacoes", [])}
@@ -901,6 +944,20 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
                 f"Item {i + 1} ({nome_item}): ofertas provisórias adotadas. "
                 "Verifique os links manualmente."
             )
+
+        # ---------- priorizar ofertas NÃO esgotadas ----------
+        if usadas:
+            usadas_ok = [c for c in usadas if not c.get("esgotado")]
+            usadas_esgotadas = [c for c in usadas if c.get("esgotado")]
+            if usadas_ok:
+                usadas = usadas_ok + usadas_esgotadas  # esgotadas ficam por último
+            else:
+                if usadas_esgotadas:
+                    avisos.append(
+                        f"Item {i + 1} ({nome_item}): todas as ofertas válidas estão esgotadas. "
+                        "Elas serão usadas como última alternativa."
+                    )
+                usadas = usadas_esgotadas
 
         if usadas:
             for c in usadas:
@@ -946,6 +1003,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             "diagnostico": logs.get(i, []),
             "confianca": confianca,
             "justificativa": str(v.get("justificativa") or ""),
+            "requisitos_nao_atendidos": v.get("requisitos_nao_atendidos", []),
         })
 
     tasks = [(l, u) for l in linhas for u in l["imagem_candidatas"]]
@@ -1263,17 +1321,46 @@ require_login()
 
 st.session_state.setdefault("gen_id", 0)
 
+# ---------- sidebar com persistência de cookies ----------
 with st.sidebar:
     st.header("🏢 Dados do proponente")
+
+    # chaves usadas para sincronizar com cookies
+    cookie_keys = [
+        "emp_razao_social", "emp_cnpj", "emp_endereco", "emp_contato",
+        "emp_representante", "emp_cargo", "emp_cidade", "emp_edital",
+    ]
+
+    if HAS_ST_COOKIE:
+        with st_cookie.sync(*cookie_keys):
+            razao_social = st.text_input("Razão social", key="emp_razao_social")
+            cnpj = st.text_input("CNPJ", key="emp_cnpj")
+            endereco = st.text_input("Endereço", key="emp_endereco")
+            contato = st.text_input("E-mail / telefone", key="emp_contato")
+            representante = st.text_input("Representante legal", key="emp_representante")
+            cargo = st.text_input("Cargo", key="emp_cargo")
+            cidade = st.text_input("Cidade", key="emp_cidade")
+            edital = st.text_input("Edital / Pregão nº", key="emp_edital")
+    else:
+        st.caption("⚠️ `st-cookie` não instalado — os dados não serão lembrados entre sessões.")
+        razao_social = st.text_input("Razão social", key="emp_razao_social")
+        cnpj = st.text_input("CNPJ", key="emp_cnpj")
+        endereco = st.text_input("Endereço", key="emp_endereco")
+        contato = st.text_input("E-mail / telefone", key="emp_contato")
+        representante = st.text_input("Representante legal", key="emp_representante")
+        cargo = st.text_input("Cargo", key="emp_cargo")
+        cidade = st.text_input("Cidade", key="emp_cidade")
+        edital = st.text_input("Edital / Pregão nº", key="emp_edital")
+
     empresa = {
-        "razao_social": st.text_input("Razão social"),
-        "cnpj": st.text_input("CNPJ"),
-        "endereco": st.text_input("Endereço"),
-        "contato": st.text_input("E-mail / telefone"),
-        "representante": st.text_input("Representante legal"),
-        "cargo": st.text_input("Cargo"),
-        "cidade": st.text_input("Cidade"),
-        "edital": st.text_input("Edital / Pregão nº"),
+        "razao_social": razao_social,
+        "cnpj": cnpj,
+        "endereco": endereco,
+        "contato": contato,
+        "representante": representante,
+        "cargo": cargo,
+        "cidade": cidade,
+        "edital": edital,
     }
 
     with st.expander("🤖 Provedores de IA (fallback automático)", expanded=True):
@@ -1497,10 +1584,17 @@ if proposta:
 
             if l["cotacoes"]:
                 st.markdown("**Ofertas encontradas**")
+                # Adiciona coluna "Esgotado" para transparência
                 st.dataframe(
                     pd.DataFrame([
-                        {"Usada": q.get("usada", False), "Loja": q["loja"],
-                         "Produto": q["titulo"], "Preço": q["preco"], "Link": q["url"]}
+                        {
+                            "Usada": q.get("usada", False),
+                            "Loja": q["loja"],
+                            "Produto": q["titulo"],
+                            "Preço": q["preco"],
+                            "Esgotado": "Sim" if q.get("esgotado") else "Não",
+                            "Link": q["url"],
+                        }
                         for q in l["cotacoes"]
                     ]),
                     hide_index=True,
@@ -1513,6 +1607,12 @@ if proposta:
                 with st.popover("Sugestões sem preço extraído"):
                     for q in l["sem_preco"][:8]:
                         st.markdown(f"- [{q['titulo']}]({q['url']}) — *{q['motivo_sem_preco']}*")
+
+            # Mostra requisitos não atendidos, se houver
+            if l.get("requisitos_nao_atendidos"):
+                st.caption(
+                    "⚠️ Requisitos não atendidos: " + ", ".join(l["requisitos_nao_atendidos"])
+                )
 
     anexo = st.checkbox("Incluir anexo com a pesquisa de preços e links no PDF")
 
