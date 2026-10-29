@@ -663,6 +663,10 @@ class ProviderAuthError(Exception):
     pass
 
 
+def _err_msg(e: Exception) -> str:
+    return str(e).replace("\n", " ")[:160]
+
+
 @dataclass
 class ProviderConfig:
     name: str
@@ -676,6 +680,7 @@ class MultiProviderLLM:
     def __init__(self, providers: list[ProviderConfig]):
         self.providers = providers
         self.last_used: Optional[tuple[str, str]] = None
+        self.error_log: dict[str, list[str]] = {}
 
     def _client(self, p: ProviderConfig) -> OpenAI:
         return OpenAI(api_key=p.api_key, base_url=p.base_url, max_retries=1, timeout=90)
@@ -683,6 +688,7 @@ class MultiProviderLLM:
     def _try_provider(self, p: ProviderConfig, system: str, user: str) -> Optional[str]:
         client = self._client(p)
         models = [p.model] + list(p.fallback_models)
+        self.error_log[p.name] = []
         for model in models:
             for attempt in range(len(RETRY_WAITS) + 1):
                 try:
@@ -694,19 +700,28 @@ class MultiProviderLLM:
                             {"role": "user", "content": user},
                         ],
                     )
+                    content = resp.choices[0].message.content or ""
+                    if not content:
+                        self.error_log[p.name].append(f"{model}: resposta vazia")
+                        break
                     self.last_used = (p.name, model)
-                    return resp.choices[0].message.content or ""
+                    return content
                 except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
-                    raise ProviderAuthError(f"{p.name}: {type(e).__name__}") from e
-                except openai.NotFoundError:
+                    raise ProviderAuthError(
+                        f"{p.name}: {type(e).__name__} ({_err_msg(e)})"
+                    ) from e
+                except openai.NotFoundError as e:
+                    self.error_log[p.name].append(f"{model}: modelo não encontrado ({_err_msg(e)})")
                     break
                 except (openai.RateLimitError, openai.InternalServerError,
-                        openai.APIConnectionError, openai.APITimeoutError):
+                        openai.APIConnectionError, openai.APITimeoutError) as e:
                     if attempt < len(RETRY_WAITS):
                         time.sleep(RETRY_WAITS[attempt])
                     else:
+                        self.error_log[p.name].append(f"{model}: {type(e).__name__} ({_err_msg(e)})")
                         break
-                except openai.OpenAIError:
+                except openai.OpenAIError as e:
+                    self.error_log[p.name].append(f"{model}: {type(e).__name__} ({_err_msg(e)})")
                     break
         return None
 
@@ -717,7 +732,8 @@ class MultiProviderLLM:
                 result = self._try_provider(p, system, user)
                 if result:
                     return result
-                errors.append(f"{p.name}: sem resposta")
+                detalhe = " | ".join(self.error_log.get(p.name, [])) or "sem detalhes"
+                errors.append(f"{p.name}: sem resposta [{detalhe}]")
             except ProviderAuthError as e:
                 errors.append(str(e))
                 continue
