@@ -1,23 +1,13 @@
 """
-Gerador de Propostas Comerciais para Licitações (v4 — Multi-LLM Fallback + Jina Reader)
+Gerador de Propostas Comerciais para Licitações (v5 — Cache-bust + multi-imagem)
 Streamlit + agentes modulares + busca web inteligente (ddgs) + ReportLab
 
-Secrets (Streamlit Cloud > Settings > Secrets):
-    # Provedor Principal: Google Gemini
-    GEMINI_API_KEY   = "..."
-    GEMINI_MODEL     = "gemini-2.5-flash"            # aceita lista: "gemini-2.5-flash,gemini-1.5-flash"
-
-    # Backup 1: Groq
-    GROQ_API_KEY     = "..."
-    GROQ_MODEL       = "llama-3.3-70b-versatile"     # aceita lista também
-
-    # Backup 2: OpenAI ou DeepSeek
-    OPENAI_API_KEY   = "..."
-    OPENAI_BASE_URL  = "https://api.openai.com/v1"    # ou "https://api.deepseek.com"
-    OPENAI_MODEL     = "gpt-4o-mini"                  # ou "deepseek-chat"
-
-    # Opcional
-    JINA_API_KEY     = ""
+Secrets:
+    GEMINI_API_KEY, GEMINI_MODEL
+    GROQ_API_KEY,   GROQ_MODEL
+    OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    JINA_API_KEY (opcional)
+    APP_PASSWORD_HASH, APP_PASSWORD_SALT
 """
 from __future__ import annotations
 
@@ -28,6 +18,9 @@ import json
 import re
 import socket
 import time
+import uuid
+import hashlib as _hashlib
+import hmac as _hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -73,7 +66,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------------
-PROPOSTA_V = 6
+PROPOSTA_V = 7              # bumped — invalida estado antigo
 MAX_ITENS = 6
 MAX_PAGINAS_POR_ITEM = 8
 MAX_IMAGENS_POR_ITEM = 6
@@ -85,6 +78,8 @@ HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
     "Accept-Language": "pt-BR,pt;q=0.9",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
 }
 
 JINA_BASE = "https://r.jina.ai/"
@@ -97,7 +92,7 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
-RETRY_WAITS = (2, 5, 10)
+RETRY_WAITS = (2, 5)         # reduzido (era 2,5,10)
 
 BLOCKED_DOMAINS = (
     "youtube.com", "wikipedia.org", "facebook.com", "instagram.com",
@@ -122,12 +117,6 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         return default
 
-# ----------------------------------------------------------------------------
-# Autenticação (login gate)
-# ----------------------------------------------------------------------------
-import hashlib as _hashlib
-import hmac as _hmac
-
 
 def _hash_password(password: str, salt: str) -> str:
     return _hashlib.pbkdf2_hmac(
@@ -136,7 +125,6 @@ def _hash_password(password: str, salt: str) -> str:
 
 
 def require_login() -> None:
-    """Bloqueia o app até o usuário informar a senha correta."""
     if st.session_state.get("auth_ok"):
         return
 
@@ -237,25 +225,25 @@ def parse_models(s: str) -> list[str]:
 
 
 # ----------------------------------------------------------------------------
-# Busca web (DuckDuckGo)
+# Busca web (DuckDuckGo) — retry enxuto + circuit breaker feito no collect
 # ----------------------------------------------------------------------------
 def search_web(query: str, n: int = 8) -> list[dict]:
     if DDGS is None:
-        raise RuntimeError("Biblioteca de busca não instalada (adicione 'ddgs' ao requirements.txt).")
+        raise RuntimeError("Biblioteca de busca não instalada (adicione 'ddgs').")
     last = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             return list(DDGS().text(query, region="br-pt", safesearch="off", max_results=n))
         except Exception as e:
             if "no results" in str(e).lower():
                 return []
             last = e
-            time.sleep(1.5 * (attempt + 1))
+            if attempt < 1:
+                time.sleep(1.0 + attempt * 0.5)
     raise RuntimeError(f"Falha na busca web: {last}")
 
 
 def build_site_variations(item_name: str) -> list[list[str]]:
-    """Variações inteligentes de busca por item (fallback progressivo)."""
     return [
         [f'"{item_name}" site:{s}' for s in SITE_TARGETS],
         [f"{item_name} comprar", f"{item_name} preço", f"{item_name} oferta"],
@@ -281,7 +269,7 @@ def is_public_url(url: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# HTTP / Jina
+# HTTP / Jina — ambos com cache-bust
 # ----------------------------------------------------------------------------
 def fetch_html(url: str, max_bytes: int = 1_500_000) -> tuple[str, str]:
     try:
@@ -312,8 +300,13 @@ def fetch_html(url: str, max_bytes: int = 1_500_000) -> tuple[str, str]:
         return "", f"erro de rede ({type(e).__name__})"
 
 
-def fetch_jina(url: str, api_key: str = "", timeout: int = 15) -> tuple[str, str]:
-    headers = {"Accept": "text/markdown"}
+def fetch_jina(url: str, api_key: str = "", timeout: int = 20) -> tuple[str, str]:
+    headers = {
+        "Accept": "text/markdown",
+        "Cache-Control": "no-cache",
+        "x-no-cache": "true",
+        "x-cache-tolerance": "0",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
@@ -544,7 +537,6 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
 
     imgs = extract_images_from_html(html, url) if html else []
 
-    # Jina como fallback somente quando necessário (economiza cota)
     if use_jina and (not html or (not info.get("preco") and len(imgs) < 2)):
         md, _ = fetch_jina(url, jina_key)
         if md:
@@ -584,25 +576,40 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
     }
 
 
-def collect_quotes(queries_by_item, item_names, avisos, use_jina=True, jina_key="", on_step=lambda m: None):
+def collect_quotes(queries_by_item, item_names, avisos, use_jina=True,
+                   jina_key="", on_step=lambda m: None):
     cands = {i: [] for i in queries_by_item}
     sem_preco = {i: [] for i in queries_by_item}
     logs = {i: [] for i in queries_by_item}
     seen = {i: set() for i in queries_by_item}
 
+    state = {"fails": 0, "disabled": False}
+    MAX_FAILS = 3
+
     def run_phase(qs_by_item: dict[int, list[str]]) -> None:
-        if not qs_by_item:
+        if not qs_by_item or state["disabled"]:
             return
         found: dict[int, list[dict]] = {i: [] for i in qs_by_item}
         for i, qs in qs_by_item.items():
             for q in qs:
+                if state["disabled"]:
+                    break
                 on_step(f"🌐 Pesquisando: “{q}”")
                 try:
                     results = search_web(q)
+                    state["fails"] = 0
                     logs[i].append({"consulta": q, "resultados": len(results), "erro": ""})
                 except Exception as e:
-                    avisos.append(str(e))
+                    state["fails"] += 1
+                    avisos.append(f"Busca falhou: {e}")
                     logs[i].append({"consulta": q, "resultados": 0, "erro": str(e)})
+                    if state["fails"] >= MAX_FAILS:
+                        state["disabled"] = True
+                        avisos.append(
+                            "⚠️ Muitas falhas consecutivas na busca web — "
+                            "encerrando buscas desta execução."
+                        )
+                        break
                     continue
                 for r in results:
                     url = r.get("href") or ""
@@ -610,7 +617,7 @@ def collect_quotes(queries_by_item, item_names, avisos, use_jina=True, jina_key=
                     if url and url not in seen[i] and not _is_blocked(host):
                         seen[i].add(url)
                         found[i].append(r)
-                time.sleep(0.4)
+                time.sleep(0.2)
             found[i] = found[i][:MAX_PAGINAS_POR_ITEM]
 
         if not any(found.values()):
@@ -638,10 +645,10 @@ def collect_quotes(queries_by_item, item_names, avisos, use_jina=True, jina_key=
     run_phase(queries_by_item)
 
     for i, name in item_names.items():
-        if cands[i]:
+        if cands[i] or state["disabled"]:
             continue
         for var in build_site_variations(name):
-            if cands[i]:
+            if cands[i] or state["disabled"]:
                 break
             on_step(f"🔁 Tentativa extra para item {i + 1}: variação de busca...")
             run_phase({i: var})
@@ -666,8 +673,6 @@ class ProviderConfig:
 
 
 class MultiProviderLLM:
-    """Tenta provedores em sequência, com retries internos e fallback transparente."""
-
     def __init__(self, providers: list[ProviderConfig]):
         self.providers = providers
         self.last_used: Optional[tuple[str, str]] = None
@@ -683,7 +688,7 @@ class MultiProviderLLM:
                 try:
                     resp = client.chat.completions.create(
                         model=model,
-                        temperature=0.2,
+                        temperature=0.4,                    # leve variação
                         messages=[
                             {"role": "system", "content": system},
                             {"role": "user", "content": user},
@@ -694,13 +699,13 @@ class MultiProviderLLM:
                 except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
                     raise ProviderAuthError(f"{p.name}: {type(e).__name__}") from e
                 except openai.NotFoundError:
-                    break  # modelo inexistente → tenta próximo modelo
+                    break
                 except (openai.RateLimitError, openai.InternalServerError,
                         openai.APIConnectionError, openai.APITimeoutError):
                     if attempt < len(RETRY_WAITS):
                         time.sleep(RETRY_WAITS[attempt])
                     else:
-                        break  # esgotou retries → próximo modelo
+                        break
                 except openai.OpenAIError:
                     break
         return None
@@ -769,8 +774,10 @@ SCHEMA_RED = (
 # ----------------------------------------------------------------------------
 # Pipeline
 # ----------------------------------------------------------------------------
-def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambda msg: None) -> dict:
+def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
+                 on_step=lambda msg: None, run_seed: str = "") -> dict:
     avisos: list[str] = []
+    run_seed = run_seed or uuid.uuid4().hex[:8]
 
     on_step("🔎 Analisando requisitos do edital...")
     analista = Agent(
@@ -797,9 +804,13 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
         llm,
     )
     qry = pesquisador.run(
-        "Para cada item, crie 2 consultas de busca eficientes (4 a 8 palavras) para encontrar o produto em lojas online. "
-        "Estime também uma faixa de preço unitário razoável em reais (min e max).\n"
-        f"Formato JSON esperado: {SCHEMA_QRY}\n\nITENS:\n{json.dumps(itens, ensure_ascii=False)}"
+        f"[run-seed={run_seed}] Use este seed para VARIAR as consultas a cada execução — "
+        "evite repetir exatamente as mesmas queries de execuções anteriores.\n"
+        "Para cada item, crie 2 consultas de busca eficientes (4 a 8 palavras) para encontrar "
+        "o produto em lojas online. Estime também uma faixa de preço unitário razoável "
+        "em reais (min e max).\n"
+        f"Formato JSON esperado: {SCHEMA_QRY}\n\n"
+        f"ITENS:\n{json.dumps(itens, ensure_ascii=False)}"
     )
     queries = {i: [] for i in range(len(itens))}
     faixas: dict[int, tuple[float, float]] = {}
@@ -820,7 +831,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
     cands, sem_preco, logs = collect_quotes(
         queries, item_names, avisos, use_jina=use_jina, jina_key=jina_key, on_step=on_step
     )
-    pesquisa_em = now_br().strftime("%d/%m/%Y %H:%M")
+    pesquisa_em = now_br().strftime("%d/%m/%Y %H:%M:%S")
 
     for i, cs in cands.items():
         fx = faixas.get(i)
@@ -846,7 +857,8 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
         on_step("🧪 Validando ofertas e selecionando melhor custo-benefício...")
         val = pesquisador.run(
             "Selecione em 'validos' os ids das ofertas compatíveis com o produto. "
-            "Priorize menor preço em lojas confiáveis (loja_conhecida=true). Indique a melhor em 'recomendado'.\n"
+            "Priorize menor preço em lojas confiáveis (loja_conhecida=true). "
+            "Indique a melhor em 'recomendado'.\n"
             f"Formato JSON esperado: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
         )
         validacoes = {int(to_float(v.get("indice"), -1)): v for v in val.get("validacoes", [])}
@@ -870,7 +882,8 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
             usadas = [c for c in by_id.values() if c["preco"] >= 0.3 * mediana]
             provisorio = True
             avisos.append(
-                f"Item {i + 1} ({nome_item}): ofertas provisórias adotadas. Verifique os links manualmente."
+                f"Item {i + 1} ({nome_item}): ofertas provisórias adotadas. "
+                "Verifique os links manualmente."
             )
 
         if usadas:
@@ -910,13 +923,15 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
             "faixa_plausivel": faixas.get(i),
             "imagem_candidatas": img_urls,
             "imagem_bytes": [],
+            "imagem_thumb": [],
             "imagem_auto": None,
+            "imagens_list": [],           # seleção final (multi)
+            "imagem_legenda": "",
             "diagnostico": logs.get(i, []),
             "confianca": confianca,
             "justificativa": str(v.get("justificativa") or ""),
         })
 
-    # Download em paralelo das imagens
     tasks = [(l, u) for l in linhas for u in l["imagem_candidatas"]]
     if tasks:
         on_step("🖼️ Baixando galeria de imagens dos produtos...")
@@ -935,6 +950,10 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
             l["imagem_bytes"] = [
                 results[(id(l), u)] for u in l["imagem_candidatas"]
                 if (id(l), u) in results
+            ]
+            l["imagem_thumb"] = [
+                normalize_image(b, max_side=200, quality=70)
+                for b in l["imagem_bytes"]
             ]
             if l["imagem_bytes"]:
                 l["imagem_auto"] = l["imagem_bytes"][0]
@@ -964,6 +983,8 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True, on_step=lambd
     cond = red.get("condicoes") or {}
     proposta = {
         "_v": PROPOSTA_V,
+        "_gen_id": uuid.uuid4().hex[:8],
+        "_run_seed": run_seed,
         "empresa": empresa,
         "data": now_br().strftime("%d/%m/%Y"),
         "pesquisa_em": pesquisa_em,
@@ -988,8 +1009,54 @@ def recalc(p: dict) -> None:
 
 
 # ----------------------------------------------------------------------------
-# PDF (ReportLab)
+# PDF
 # ----------------------------------------------------------------------------
+def _image_grid(imgs_bytes, max_size_cm=4.0, ncols=3):
+    cells = []
+    for b in imgs_bytes:
+        try:
+            w, h = PILImage.open(io.BytesIO(b)).size
+            s = min(max_size_cm * cm / w, max_size_cm * cm / h)
+            cells.append(RLImage(io.BytesIO(b), width=w * s, height=h * s))
+        except Exception:
+            cells.append("")
+    rows, row = [], []
+    for c in cells:
+        row.append(c)
+        if len(row) == ncols:
+            rows.append(row); row = []
+    if row:
+        while len(row) < ncols:
+            row.append("")
+        rows.append(row)
+    t = Table(rows, colWidths=[(17.0 / ncols) * cm] * ncols)
+    t.setStyle(TableStyle([
+        ("ALIGN",  (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return t
+
+
+def _pdf_signature(p: dict, anexo: bool) -> str:
+    h = _hashlib.sha256()
+    h.update(f"{PROPOSTA_V}|{anexo}".encode())
+    h.update(p.get("apresentacao", "").encode("utf-8", "ignore"))
+    for l in p["linhas"]:
+        for k in ("numero", "nome", "unidade", "quantidade", "preco_unitario",
+                  "subtotal", "descricao_proposta"):
+            h.update(str(l.get(k, "")).encode("utf-8", "ignore"))
+        for s in l.get("especificacoes_finais") or []:
+            h.update(str(s).encode("utf-8", "ignore"))
+        for img in l.get("imagens_list") or []:
+            h.update(_hashlib.md5(img).digest())
+        # legado
+        if l.get("imagem"):
+            h.update(_hashlib.md5(l["imagem"]).digest())
+    return h.hexdigest()
+
+
 def build_pdf(p: dict, anexo: bool = False) -> bytes:
     emp = p["empresa"]
     buf = io.BytesIO()
@@ -1012,6 +1079,8 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
     center = ParagraphStyle("center", parent=base, alignment=TA_CENTER)
     bullet = ParagraphStyle("bullet", parent=base, leftIndent=14, bulletIndent=3)
     small = ParagraphStyle("small", parent=base, fontSize=8, leading=10)
+    cap = ParagraphStyle("cap", parent=base, fontSize=7.5, leading=9,
+                         alignment=TA_CENTER, textColor=colors.grey)
 
     def P(text, style=base):
         return Paragraph(escape(str(text)).replace("\n", "<br/>"), style)
@@ -1061,20 +1130,25 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
     story.append(it)
 
     story.append(P("4. Especificações técnicas", h2))
-    cap = ParagraphStyle("cap", parent=base, fontSize=7.5, leading=9,
-                         alignment=TA_CENTER, textColor=colors.grey)
     for l in p["linhas"]:
         story.append(P(
             f"Item {l['numero']} — {l['nome']}",
             ParagraphStyle("b", parent=base, fontName="Helvetica-Bold", spaceBefore=4, spaceAfter=2),
         ))
-        bullets = [Paragraph(escape(s), bullet, bulletText="•") for s in (l["especificacoes_finais"] or ["Conforme edital."])]
-        placed = False
-        if l.get("imagem") and len(bullets) <= 25:
+        bullets = [Paragraph(escape(s), bullet, bulletText="•")
+                   for s in (l["especificacoes_finais"] or ["Conforme edital."])]
+
+        imgs = (l.get("imagens_list") or [])[:MAX_IMAGENS_POR_ITEM]
+        if not imgs and l.get("imagem"):
+            imgs = [l["imagem"]]
+
+        if not imgs:
+            story += bullets
+        elif len(imgs) == 1:
             try:
-                w, h = PILImage.open(io.BytesIO(l["imagem"])).size
+                w, h = PILImage.open(io.BytesIO(imgs[0])).size
                 s = min(4.2 * cm / w, 4.2 * cm / h)
-                cell = [RLImage(io.BytesIO(l["imagem"]), width=w * s, height=h * s)]
+                cell = [RLImage(io.BytesIO(imgs[0]), width=w * s, height=h * s)]
                 if l.get("imagem_legenda"):
                     cell.append(P(l["imagem_legenda"], cap))
                 tb = Table([[bullets, cell]], colWidths=[12.6 * cm, 4.4 * cm])
@@ -1084,11 +1158,12 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
                     ("RIGHTPADDING", (0, 0), (-1, -1), 0),
                 ]))
                 story.append(tb)
-                placed = True
             except Exception:
-                placed = False
-        if not placed:
+                story += bullets
+        else:
             story += bullets
+            story.append(Spacer(1, 4))
+            story.append(_image_grid(imgs, max_size_cm=4.0, ncols=min(3, len(imgs))))
 
     c = p["condicoes"]
     story.append(P("5. Condições comerciais", h2))
@@ -1154,15 +1229,24 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
 
 
 # ----------------------------------------------------------------------------
+# Limpeza de estado
+# ----------------------------------------------------------------------------
+def _reset_proposal_state() -> None:
+    for k in list(st.session_state.keys()):
+        if any(k.startswith(p) for p in ("up_", "sel_", "imgpick_", "editor_", "_pdf_")):
+            del st.session_state[k]
+    st.session_state.pop("proposta", None)
+    st.session_state.pop("llm_used", None)
+
+
+# ----------------------------------------------------------------------------
 # Interface Streamlit
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Gerador de Propostas", page_icon="📄", layout="wide")
 
-require_login()          # ← bloqueia tudo abaixo até autenticar
+require_login()
 
 st.session_state.setdefault("gen_id", 0)
-# ... resto do código permanece idêntico ...
-
 
 with st.sidebar:
     st.header("🏢 Dados do proponente")
@@ -1233,6 +1317,12 @@ with st.sidebar:
             st.success("Chave Jina carregada.")
         use_jina = st.checkbox("Usar Jina Reader (renderiza JS)", value=True)
 
+    st.divider()
+    if st.button("🔄 Limpar sessão / recomeçar",
+                 help="Apaga resultado atual e widgets antigos (não desloga)"):
+        _reset_proposal_state()
+        st.rerun()
+
 # Monta lista de provedores
 providers: list[ProviderConfig] = []
 g_models = parse_models(g_models_str)
@@ -1247,6 +1337,8 @@ if oa_key and oa_models:
 
 st.title("📄 Gerador de Propostas para Licitações")
 st.caption("Cole a especificação do edital: os agentes pesquisam preços reais na web e geram a proposta em PDF.")
+st.caption("💡 Cada geração faz uma pesquisa nova (seed aleatório). "
+           "Se desconfiar de resultados antigos, abra o painel “Consultas executadas” abaixo.")
 
 edital_text = st.text_area(
     "Especificação do produto (texto bruto do edital)", height=260,
@@ -1262,16 +1354,21 @@ if st.button("Gerar Proposta Comercial", type="primary"):
     elif not providers:
         st.warning("Informe ao menos uma chave de API na barra lateral (ou nos Secrets).")
     else:
+        # Defensivo: descarta QUALQUER estado da geração anterior
+        _reset_proposal_state()
         llm = MultiProviderLLM(providers)
+        run_seed = uuid.uuid4().hex[:8]
         try:
             with st.spinner("Os agentes estão trabalhando (a pesquisa web pode levar alguns instantes)..."):
                 status = st.empty()
-                st.session_state["proposta"] = run_pipeline(
+                proposta_new = run_pipeline(
                     llm, edital_text.strip(), empresa,
                     jina_key=jina_key or "",
                     use_jina=use_jina,
                     on_step=status.info,
+                    run_seed=run_seed,
                 )
+                st.session_state["proposta"] = proposta_new
                 st.session_state["gen_id"] += 1
                 st.session_state["llm_used"] = llm.last_used
                 status.empty()
@@ -1286,7 +1383,7 @@ if st.button("Gerar Proposta Comercial", type="primary"):
 
 proposta = st.session_state.get("proposta")
 if proposta and proposta.get("_v") != PROPOSTA_V:
-    st.session_state.pop("proposta", None)
+    _reset_proposal_state()
     proposta = None
     st.info("O app foi atualizado. Gere a proposta novamente.")
 
@@ -1295,10 +1392,28 @@ if proposta:
     if st.session_state.get("llm_used"):
         name, model = st.session_state["llm_used"]
         st.caption(f"🤖 Provedor usado: **{name}** · `{model}`")
+    st.caption(
+        f"🆔 Proposta `{proposta.get('_gen_id', '?')}` · "
+        f"pesquisa de **{proposta['pesquisa_em']}** · "
+        f"seed `{proposta.get('_run_seed', '?')}`"
+    )
 
     st.subheader("Revise os valores e itens")
     for aviso in proposta["avisos"]:
         st.warning(aviso)
+
+    with st.expander("🔍 Consultas efetivamente executadas (verificação)"):
+        st.caption(
+            "Estes são os termos e quantidades que **realmente** foram enviados ao buscador "
+            "nesta execução. Se aparecer algo que não tem a ver com o edital, o problema é a "
+            "interpretação da IA (edital ambíguo) — não cache."
+        )
+        for l in proposta["linhas"]:
+            st.markdown(f"**Item {l['numero']} — {l['nome']}**")
+            for d in l.get("diagnostico", []):
+                q, n, err = d.get("consulta", ""), d.get("resultados", 0), d.get("erro", "")
+                icon = "❌" if err else "✓"
+                st.caption(f"{icon} `{q}` — {n} resultado(s){' · ' + err if err else ''}")
 
     df = pd.DataFrame([
         {"Item": l["numero"], "Produto": l["nome"], "Un.": l["unidade"], "Qtd": l["quantidade"],
@@ -1308,7 +1423,8 @@ if proposta:
         for l in proposta["linhas"]
     ])
     edited = st.data_editor(
-        df, hide_index=True, disabled=["Item", "Produto", "Un.", "Faixa encontrada", "Confiança"],
+        df, hide_index=True,
+        disabled=["Item", "Produto", "Un.", "Faixa encontrada", "Confiança"],
         key=f"editor_{st.session_state['gen_id']}",
         column_config={
             "Qtd": st.column_config.NumberColumn(min_value=0.0),
@@ -1332,45 +1448,45 @@ if proposta:
         ):
             gid = f"{st.session_state['gen_id']}_{l['numero']}"
 
-            # Upload próprio (sobrescreve seleção)
             up = st.file_uploader(
                 "Enviar imagem própria (PNG, JPG, WEBP)",
                 type=["png", "jpg", "jpeg", "webp"],
                 key=f"up_{gid}",
             )
-            img_escolhida = None
+            chosen_full: list[bytes] = []
+
             if up is not None:
-                img_escolhida = normalize_image(up.getvalue())
+                norm = normalize_image(up.getvalue())
+                if norm:
+                    chosen_full = [norm]
+                    st.image(norm, width=180, caption="Upload próprio")
+            else:
+                thumbs = l.get("imagem_thumb") or []
+                fulls = l.get("imagem_bytes") or []
+                if thumbs:
+                    st.markdown(
+                        f"**{len(thumbs)} imagem(ns) encontrada(s) — marque as que irão para o PDF:**"
+                    )
+                    ncols = min(3, len(thumbs))
+                    cols = st.columns(ncols)
+                    for idx, thumb in enumerate(thumbs):
+                        with cols[idx % ncols]:
+                            st.image(thumb, width=150, caption=f"Foto {idx + 1}")
+                            incluir = st.checkbox(
+                                "Incluir no PDF",
+                                value=(idx == 0),
+                                key=f"imgpick_{gid}_{idx}",
+                            )
+                            if incluir and idx < len(fulls):
+                                chosen_full.append(fulls[idx])
+                    if chosen_full:
+                        st.caption(f"✅ {len(chosen_full)} imagem(ns) selecionada(s) para este item.")
+                else:
+                    st.caption("Nenhuma imagem encontrada automaticamente. Faça upload se desejar.")
 
-            # Grid de miniaturas
-            imgs = l.get("imagem_bytes") or []
-            if imgs and img_escolhida is None:
-                st.markdown("**Galeria de imagens encontradas**")
-                ncols = min(3, len(imgs))
-                cols = st.columns(ncols)
-                for idx, b in enumerate(imgs):
-                    with cols[idx % ncols]:
-                        st.image(b, width=150, caption=f"Foto {idx + 1}")
-                opcoes = ["Nenhuma"] + [f"Foto {i + 1}" for i in range(len(imgs))]
-                escolha = st.radio(
-                    "Selecione a imagem que aparecerá no PDF:",
-                    opcoes,
-                    index=0,
-                    horizontal=True,
-                    key=f"sel_{gid}",
-                )
-                if escolha != "Nenhuma":
-                    img_escolhida = imgs[opcoes.index(escolha) - 1]
-            elif not imgs and img_escolhida is None:
-                st.caption("Nenhuma imagem encontrada automaticamente. Faça upload se desejar.")
-
-            if img_escolhida:
-                st.image(img_escolhida, width=180)
-
-            l["imagem"], l["imagem_legenda"] = (
-                (img_escolhida, "Imagem ilustrativa") if incluir_imagens and img_escolhida
-                else (None, "")
-            )
+            l["imagens_list"] = chosen_full if incluir_imagens else []
+            l["imagem_legenda"] = "Imagem ilustrativa" if l["imagens_list"] else ""
+            l["imagem"] = None  # legado: não usar mais
 
             if l["cotacoes"]:
                 st.markdown("**Ofertas encontradas**")
@@ -1392,13 +1508,25 @@ if proposta:
                         st.markdown(f"- [{q['titulo']}]({q['url']}) — *{q['motivo_sem_preco']}*")
 
     anexo = st.checkbox("Incluir anexo com a pesquisa de preços e links no PDF")
-    try:
+
+    sig = _pdf_signature(final, anexo)
+    if st.session_state.get("_pdf_sig") != sig:
+        try:
+            st.session_state["_pdf_bytes"] = build_pdf(final, anexo)
+            st.session_state["_pdf_sig"] = sig
+            st.session_state["_pdf_name"] = (
+                f"proposta_{now_br().strftime('%Y%m%d_%H%M%S')}_"
+                f"{uuid.uuid4().hex[:6]}.pdf"
+            )
+        except Exception as e:
+            st.session_state["_pdf_bytes"] = None
+            st.error(f"Erro ao gerar o PDF: {e}")
+
+    if st.session_state.get("_pdf_bytes"):
         st.download_button(
             "⬇️ Baixar proposta em PDF",
-            data=build_pdf(final, anexo),
+            data=st.session_state["_pdf_bytes"],
             mime="application/pdf",
-            file_name=f"proposta_comercial_{now_br().date().isoformat()}.pdf",
+            file_name=st.session_state["_pdf_name"],
             type="primary",
         )
-    except Exception as e:
-        st.error(f"Erro ao gerar o PDF: {e}")
