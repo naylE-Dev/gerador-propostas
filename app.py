@@ -1,5 +1,5 @@
 """
-Gerador de Propostas Comerciais para Licitações (v7 — com persistência, detecção de esgotado e requisitos parciais)
+Gerador de Propostas Comerciais para Licitações (v8 — corrige numeração do edital)
 Streamlit + agentes modulares + busca web inteligente (ddgs) + ReportLab
 
 Secrets:
@@ -73,7 +73,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------------
-PROPOSTA_V = 8
+PROPOSTA_V = 9  # bump: força regeneração (novo campo 'numero' vindo do edital + 'indice')
 MAX_ITENS = 6
 MAX_PAGINAS_POR_ITEM = 8
 MAX_IMAGENS_POR_ITEM = 6
@@ -810,7 +810,7 @@ class Agent:
 
 
 SCHEMA_REQ = (
-    '{"itens":[{"nome_produto":"","especificacoes_obrigatorias":[""],'
+    '{"itens":[{"numero_edital":"","nome_produto":"","especificacoes_obrigatorias":[""],'
     '"quantidade":1,"unidade":"un","requisitos_minimos":[""]}]}'
 )
 SCHEMA_QRY = (
@@ -845,13 +845,20 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
     )
     req = analista.run(
         "Extraia os itens a serem adquiridos do texto do edital. Quantidade padrão é 1.\n"
+        "IMPORTANTE: preencha 'numero_edital' com o número/rótulo do item EXATAMENTE como "
+        "aparece no texto original (ex.: '4', 'Item 4', 'IV', '3.1'). Se não houver numeração "
+        "explícita no texto, deixe 'numero_edital' como string vazia.\n"
         f"Formato JSON esperado: {SCHEMA_REQ}\n\nTEXTO:\n<<<\n{edital}\n>>>"
     )
     itens = (req.get("itens") or [])[:MAX_ITENS]
     if not itens:
         raise ValueError("Não foi possível identificar itens no texto fornecido.")
+
+    # ---------- normaliza numeração: 'numero' (exibição) e 'indice' (interno) ----------
     for i, it in enumerate(itens):
         it["indice"] = i
+        raw_num = str(it.get("numero_edital") or "").strip()
+        it["numero"] = raw_num if raw_num else str(i + 1)
 
     on_step("💰 Planejando buscas de mercado...")
     pesquisador = Agent(
@@ -884,7 +891,10 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
         if not queries[i]:
             queries[i] = [f"{it.get('nome_produto', '')} comprar preço"]
 
-    item_names = {i: str(it.get("nome_produto") or f"Item {i + 1}") for i, it in enumerate(itens)}
+    item_names = {
+        i: str(it.get("nome_produto") or f"Item {it.get('numero', i + 1)}")
+        for i, it in enumerate(itens)
+    }
     cands, sem_preco, logs = collect_quotes(
         queries, item_names, avisos, use_jina=use_jina, jina_key=jina_key, on_step=on_step
     )
@@ -915,7 +925,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
         val = pesquisador.run(
             "Selecione em 'validos' os ids das ofertas compatíveis com o produto, "
             "permitindo até 3 requisitos não atendidos. "
-            "Priorize menor preço em lojas confiáveis (loja_conhecida=true). "
+            "Priorize menor preço em lojas confiáveis (loja_conhecida=true) e ofertas NÃO esgotadas. "
             "Indique a melhor em 'recomendado'. "
             "Para ofertas com requisitos não atendidos, liste-os em 'requisitos_nao_atendidos'.\n"
             f"Formato JSON esperado: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -925,6 +935,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
     linhas = []
     for i, it in enumerate(itens):
         nome_item = item_names[i]
+        num_disp = it["numero"]  # exibição (ex.: "4" ou sequencial "1")
         v = validacoes.get(i, {})
         cs = cands.get(i, [])
         by_id = {c["id"]: c for c in cs if not c["implausivel"]}
@@ -941,7 +952,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             usadas = [c for c in by_id.values() if c["preco"] >= 0.3 * mediana]
             provisorio = True
             avisos.append(
-                f"Item {i + 1} ({nome_item}): ofertas provisórias adotadas. "
+                f"Item {num_disp} ({nome_item}): ofertas provisórias adotadas. "
                 "Verifique os links manualmente."
             )
 
@@ -954,7 +965,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             else:
                 if usadas_esgotadas:
                     avisos.append(
-                        f"Item {i + 1} ({nome_item}): todas as ofertas válidas estão esgotadas. "
+                        f"Item {num_disp} ({nome_item}): todas as ofertas válidas estão esgotadas. "
                         "Elas serão usadas como última alternativa."
                     )
                 usadas = usadas_esgotadas
@@ -976,11 +987,12 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             confianca = "baixa (provisória)" if provisorio else ("alta" if len(usadas) >= 2 else "média")
         else:
             preco, faixa, confianca, ref = 0.0, (0.0, 0.0), "sem cotação", ""
-            avisos.append(f"Item {i + 1} ({nome_item}): nenhuma oferta encontrada automaticamente.")
+            avisos.append(f"Item {num_disp} ({nome_item}): nenhuma oferta encontrada automaticamente.")
 
         qtd = to_float(it.get("quantidade"), 1.0) or 1.0
         linhas.append({
-            "numero": i + 1,
+            "numero": num_disp,          # exibição (string, ex.: "4")
+            "indice": i,                 # interno (0-based, para mapeamento)
             "nome": nome_item,
             "unidade": str(it.get("unidade") or "un"),
             "quantidade": qtd,
@@ -1041,7 +1053,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
     )
     resumo = [
         {"nome": l["nome"], "unidade": l["unidade"], "quantidade": l["quantidade"],
-         "especificacoes": l["especificacoes"], "indice": l["numero"] - 1}
+         "especificacoes": l["especificacoes"], "indice": l["indice"]}
         for l in linhas
     ]
     red = redator.run(
@@ -1049,8 +1061,8 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
         f"Formato JSON esperado: {SCHEMA_RED}\n\nITENS:\n{json.dumps(resumo, ensure_ascii=False)}"
     )
     red_map = {int(to_float(r.get("indice"), -1)): r for r in red.get("itens", [])}
-    for i, l in enumerate(linhas):
-        r = red_map.get(i, {})
+    for l in linhas:
+        r = red_map.get(l["indice"], {})
         l["descricao_proposta"] = str(r.get("descricao_proposta") or l["descricao"] or l["nome"])
         l["especificacoes_finais"] = as_list(r.get("especificacoes")) or (l["especificacoes"] + l["requisitos"])
 
@@ -1325,7 +1337,6 @@ st.session_state.setdefault("gen_id", 0)
 with st.sidebar:
     st.header("🏢 Dados do proponente")
 
-    # chaves usadas para sincronizar com cookies
     cookie_keys = [
         "emp_razao_social", "emp_cnpj", "emp_endereco", "emp_contato",
         "emp_representante", "emp_cargo", "emp_cidade", "emp_edital",
@@ -1442,7 +1453,7 @@ st.caption("Cole a especificação do edital: os agentes pesquisam preços reais
 edital_text = st.text_area(
     "Especificação do produto (texto bruto do edital)", height=260,
     placeholder=(
-        'Ex.: Item 1 — Notebook, processador mínimo 8 núcleos, 16 GB RAM, '
+        'Ex.: Item 4 — Notebook, processador mínimo 8 núcleos, 16 GB RAM, '
         'SSD 512 GB, tela 15,6". Quantidade: 20 unidades.'
     ),
 )
@@ -1540,7 +1551,8 @@ if proposta:
             f"Item {l['numero']} — {l['nome']}  ·  ofertas: {len(l['cotacoes'])}  ·  confiança: {l['confianca']}",
             expanded=not l["cotacoes"],
         ):
-            gid = f"{st.session_state['gen_id']}_{l['numero']}"
+            # chave estável baseada no índice interno (não no número exibido)
+            gid = f"{st.session_state['gen_id']}_{l['indice']}"
 
             up = st.file_uploader(
                 "Enviar imagem própria (PNG, JPG, WEBP)",
@@ -1584,7 +1596,6 @@ if proposta:
 
             if l["cotacoes"]:
                 st.markdown("**Ofertas encontradas**")
-                # Adiciona coluna "Esgotado" para transparência
                 st.dataframe(
                     pd.DataFrame([
                         {
@@ -1608,7 +1619,6 @@ if proposta:
                     for q in l["sem_preco"][:8]:
                         st.markdown(f"- [{q['titulo']}]({q['url']}) — *{q['motivo_sem_preco']}*")
 
-            # Mostra requisitos não atendidos, se houver
             if l.get("requisitos_nao_atendidos"):
                 st.caption(
                     "⚠️ Requisitos não atendidos: " + ", ".join(l["requisitos_nao_atendidos"])
