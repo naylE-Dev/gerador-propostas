@@ -122,6 +122,64 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         return default
 
+# ----------------------------------------------------------------------------
+# Autenticação (login gate)
+# ----------------------------------------------------------------------------
+import hashlib as _hashlib
+import hmac as _hmac
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return _hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000
+    ).hex()
+
+
+def require_login() -> None:
+    """Bloqueia o app até o usuário informar a senha correta."""
+    if st.session_state.get("auth_ok"):
+        return
+
+    st.session_state.setdefault("auth_fails", 0)
+    st.session_state.setdefault("auth_lock_until", 0.0)
+
+    now = time.time()
+    if now < st.session_state["auth_lock_until"]:
+        wait = int(st.session_state["auth_lock_until"] - now) + 1
+        st.error(f"🔒 Bloqueado por excesso de tentativas. Aguarde {wait}s.")
+        st.stop()
+
+    st.title("🔒 Acesso restrito")
+    st.caption("Informe a senha para acessar o gerador de propostas.")
+
+    with st.form("login_form"):
+        pwd = st.text_input("Senha", type="password", key="login_pwd")
+        ok = st.form_submit_button("Entrar", type="primary")
+
+    if ok:
+        stored_hash = get_secret("APP_PASSWORD_HASH")
+        salt = get_secret("APP_PASSWORD_SALT")
+        if not stored_hash or not salt:
+            st.error("❌ Credenciais não configuradas. Verifique os Secrets.")
+            st.stop()
+
+        candidate = _hash_password(pwd, salt)
+        if _hmac.compare_digest(candidate, stored_hash):
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_fails"] = 0
+            st.session_state["auth_lock_until"] = 0.0
+            st.rerun()
+        else:
+            st.session_state["auth_fails"] += 1
+            if st.session_state["auth_fails"] >= 5:
+                st.session_state["auth_lock_until"] = now + 60
+                st.session_state["auth_fails"] = 0
+                st.error("❌ Muitas tentativas. Tente novamente em 60 segundos.")
+            else:
+                restantes = 5 - st.session_state["auth_fails"]
+                st.error(f"❌ Senha incorreta. Tentativas restantes: {restantes}.")
+    st.stop()
+
 
 def now_br() -> datetime:
     try:
@@ -1099,7 +1157,12 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
 # Interface Streamlit
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Gerador de Propostas", page_icon="📄", layout="wide")
+
+require_login()          # ← bloqueia tudo abaixo até autenticar
+
 st.session_state.setdefault("gen_id", 0)
+# ... resto do código permanece idêntico ...
+
 
 with st.sidebar:
     st.header("🏢 Dados do proponente")
