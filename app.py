@@ -1,5 +1,5 @@
 """
-Gerador de Propostas Comerciais para Licitações (v8 — corrige numeração do edital)
+Gerador de Propostas Comerciais para Licitações (v9 — verificação de estoque)
 Streamlit + agentes modulares + busca web inteligente (ddgs) + ReportLab
 
 Secrets:
@@ -73,7 +73,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------------
-PROPOSTA_V = 9  # bump: força regeneração (novo campo 'numero' vindo do edital + 'indice')
+PROPOSTA_V = 10  # bump: inclui verificação de estoque
 MAX_ITENS = 6
 MAX_PAGINAS_POR_ITEM = 8
 MAX_IMAGENS_POR_ITEM = 6
@@ -125,6 +125,26 @@ OUT_OF_STOCK_BUTTON_RE = re.compile(
     r'<button[^>]*disabled[^>]*>.*?(comprar|adicionar|buy|add to cart|comprar agora)',
     re.I | re.S,
 )
+
+# ---------- padrões de estoque e limite por cliente ----------
+_STOCK_PATTERNS = [
+    re.compile(r"(?:estoque|disponibilidade|invent[áa]rio)\s*[:\-]?\s*(\d{1,6})", re.I),
+    re.compile(r"(\d{1,6})\s*(?:unidades?\s+)?(?:em|no|dispon[íi]ve[li]s?\s+(?:em|no)?)\s*estoque", re.I),
+    re.compile(r"(\d{1,6})\s+(?:unidades?|itens?|pe[çc]as?)\s+em\s+estoque", re.I),
+    re.compile(r"(\d{1,6})\s*(?:unidades?|itens?|pe[çc]as?)\s+(?:restantes?|dispon[íi]ve[li]s?)", re.I),
+    re.compile(r"(?:apenas|somente)\s+(?:restam?\s+)?(\d{1,6})\s*(?:unidades?|itens?|pe[çc]as?)", re.I),
+    re.compile(r"restam?\s+(?:apenas\s+|somente\s+)?(\d{1,6})\s*(?:unidades?|itens?|pe[çc]as?)", re.I),
+    re.compile(r"últim[ao]s?\s+(\d{1,6})\s*(?:unidades?|itens?|pe[çc]as?)", re.I),
+]
+_LIMIT_PATTERNS = [
+    re.compile(
+        r"(?:limite|m[áa]ximo|m[áa]x\.?)\s+(?:de\s+)?(\d{1,6})\s*(?:unidades?\s+)?"
+        r"(?:por|p/)\s*(?:cliente|pedido|pessoa|compra|cpf|cnpj)", re.I),
+    re.compile(r"(?:limite|m[áa]ximo|m[áa]x\.?)\s*[:\-]\s*(\d{1,6})\s*(?:unidades?)?", re.I),
+    re.compile(
+        r"(\d{1,6})\s*(?:unidades?\s+)?(?:por|p/)\s*(?:cliente|pedido|pessoa|compra|cpf|cnpj)",
+        re.I),
+]
 
 # ----------------------------------------------------------------------------
 # Utilitários
@@ -243,7 +263,7 @@ def parse_models(s: str) -> list[str]:
 
 
 # ----------------------------------------------------------------------------
-# Detecção de “esgotado”
+# Detecção de “esgotado” / estoque
 # ----------------------------------------------------------------------------
 def is_out_of_stock(html: str, text: str = "") -> bool:
     """Retorna True se a página apresentar sinais de produto esgotado."""
@@ -258,6 +278,100 @@ def is_out_of_stock(html: str, text: str = "") -> bool:
         return True
 
     return False
+
+
+def _visible_text(html: str) -> str:
+    """Extrai apenas o texto visível do HTML (remove scripts, styles, tags)."""
+    if not html:
+        return ""
+    if HAS_BS4:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "template"]):
+                tag.decompose()
+            return soup.get_text(" ", strip=True)
+        except Exception:
+            pass
+    return re.sub(r"<[^>]+>", " ", html)
+
+
+def extract_stock(html: str, text: str = "") -> dict:
+    """
+    Extrai estoque declarado e limite por cliente (unidades).
+    Retorna {'estoque': int|None, 'limite_por_cliente': int|None}.
+    None = desconhecido.
+    """
+    estoque: Optional[int] = None
+    limite: Optional[int] = None
+
+    # ---------- JSON-LD inventoryLevel ----------
+    if html:
+        for m in _LD_RE.finditer(html):
+            try:
+                data = json.loads(m.group(1).strip())
+            except Exception:
+                continue
+            for node in _walk(data):
+                offers = node.get("offers")
+                iterable = offers if isinstance(offers, list) else ([offers] if offers else [])
+                for o in iterable:
+                    if not isinstance(o, dict):
+                        continue
+                    inv = o.get("inventoryLevel")
+                    if isinstance(inv, dict):
+                        v = inv.get("value")
+                    else:
+                        v = inv
+                    try:
+                        iv = int(float(v)) if v is not None else None
+                    except (TypeError, ValueError):
+                        iv = None
+                    if iv is not None and 0 <= iv < 10_000_000:
+                        estoque = iv if estoque is None else min(estoque, iv)
+
+    # ---------- Padrões textuais ----------
+    combined = f"{_visible_text(html or '')} {text or ''}"
+
+    for pat in _STOCK_PATTERNS:
+        m = pat.search(combined)
+        if m:
+            try:
+                v = int(m.group(1))
+            except (ValueError, IndexError):
+                continue
+            if 0 <= v < 10_000_000:
+                estoque = v if estoque is None else min(estoque, v)
+
+    for pat in _LIMIT_PATTERNS:
+        m = pat.search(combined)
+        if m:
+            try:
+                v = int(m.group(1))
+            except (ValueError, IndexError):
+                continue
+            if 0 < v < 10_000_000:
+                limite = v if limite is None else min(limite, v)
+
+    return {"estoque": estoque, "limite_por_cliente": limite}
+
+
+def effective_available(offer: dict) -> Optional[int]:
+    """Máximo comprável em uma única compra (min entre estoque e limite). None = desconhecido."""
+    est = offer.get("estoque")
+    lim = offer.get("limite_por_cliente")
+    vals = [v for v in (est, lim) if v is not None and v >= 0]
+    return min(vals) if vals else None
+
+
+def _fmt_stock_cell(q: dict) -> str:
+    est = q.get("estoque")
+    lim = q.get("limite_por_cliente")
+    parts = []
+    if est is not None:
+        parts.append(f"estoque: {est}")
+    if lim is not None:
+        parts.append(f"limite: {lim}")
+    return " · ".join(parts) if parts else "—"
 
 
 # ----------------------------------------------------------------------------
@@ -573,6 +687,12 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
 
     imgs = extract_images_from_html(html, url) if html else []
 
+    # ---------- extração de estoque (HTML) ----------
+    stock = extract_stock(html or "", "")
+    estoque = stock["estoque"]
+    limite = stock["limite_por_cliente"]
+
+    # ---------- Jina (fallback de preço, imagens e estoque) ----------
     if use_jina and (not html or (not info.get("preco") and len(imgs) < 2)):
         md, _ = fetch_jina(url, jina_key)
         if md:
@@ -582,6 +702,12 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
                 if p:
                     info["preco"] = p
                     info["_origem"] = "jina markdown"
+            if estoque is None or limite is None:
+                stock_md = extract_stock("", md)
+                if estoque is None and stock_md["estoque"] is not None:
+                    estoque = stock_md["estoque"]
+                if limite is None and stock_md["limite_por_cliente"] is not None:
+                    limite = stock_md["limite_por_cliente"]
 
     imgs = list(dict.fromkeys(imgs))[:MAX_IMAGENS_POR_ITEM]
 
@@ -600,6 +726,8 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
 
     # ---------- detecção de esgotado ----------
     esgotado = is_out_of_stock(html or "", "")
+    if estoque == 0:
+        esgotado = True
 
     return {
         "imagens": imgs,
@@ -613,6 +741,8 @@ def enrich_result(r: dict, use_jina: bool = True, jina_key: str = "") -> dict:
         "n_avaliacoes": info.get("n"),
         "motivo_sem_preco": motivo,
         "esgotado": esgotado,
+        "estoque": estoque,
+        "limite_por_cliente": limite,
     }
 
 
@@ -854,7 +984,6 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
     if not itens:
         raise ValueError("Não foi possível identificar itens no texto fornecido.")
 
-    # ---------- normaliza numeração: 'numero' (exibição) e 'indice' (interno) ----------
     for i, it in enumerate(itens):
         it["indice"] = i
         raw_num = str(it.get("numero_edital") or "").strip()
@@ -910,10 +1039,12 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
         {
             "indice": i,
             "item": itens[i].get("nome_produto"),
+            "quantidade_solicitada": to_float(itens[i].get("quantidade"), 1.0) or 1.0,
             "ofertas": [
                 {k: c[k] for k in (
                     "id", "titulo", "loja", "loja_conhecida", "preco",
                     "origem", "nota", "n_avaliacoes", "esgotado",
+                    "estoque", "limite_por_cliente",
                 )}
                 for c in cs if not c["implausivel"]
             ],
@@ -925,7 +1056,12 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
         val = pesquisador.run(
             "Selecione em 'validos' os ids das ofertas compatíveis com o produto, "
             "permitindo até 3 requisitos não atendidos. "
-            "Priorize menor preço em lojas confiáveis (loja_conhecida=true) e ofertas NÃO esgotadas. "
+            "Critérios de prioridade: (1) menor preço, (2) lojas confiáveis "
+            "(loja_conhecida=true), (3) ofertas NÃO esgotadas (esgotado=false), "
+            "(4) ofertas com estoque disponível suficiente para 'quantidade_solicitada' "
+            "quando 'estoque' ou 'limite_por_cliente' forem informados. "
+            "Ofertas com estoque insuficiente ainda podem ser incluídas em 'validos' "
+            "se forem a única opção, mas priorize as que têm estoque suficiente. "
             "Indique a melhor em 'recomendado'. "
             "Para ofertas com requisitos não atendidos, liste-os em 'requisitos_nao_atendidos'.\n"
             f"Formato JSON esperado: {SCHEMA_VAL}\n\nDADOS:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -935,12 +1071,14 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
     linhas = []
     for i, it in enumerate(itens):
         nome_item = item_names[i]
-        num_disp = it["numero"]  # exibição (ex.: "4" ou sequencial "1")
+        num_disp = it["numero"]
         v = validacoes.get(i, {})
         cs = cands.get(i, [])
         by_id = {c["id"]: c for c in cs if not c["implausivel"]}
         valid_ids = [x for x in as_list(v.get("validos")) if x in by_id]
         rec = str(v.get("recomendado") or "")
+
+        qtd = to_float(it.get("quantidade"), 1.0) or 1.0
 
         usadas = [by_id[x] for x in valid_ids]
         provisorio = False
@@ -961,7 +1099,7 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             usadas_ok = [c for c in usadas if not c.get("esgotado")]
             usadas_esgotadas = [c for c in usadas if c.get("esgotado")]
             if usadas_ok:
-                usadas = usadas_ok + usadas_esgotadas  # esgotadas ficam por último
+                usadas = usadas_ok + usadas_esgotadas
             else:
                 if usadas_esgotadas:
                     avisos.append(
@@ -970,6 +1108,46 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
                     )
                 usadas = usadas_esgotadas
 
+        # ---------- verificação de estoque ----------
+        estoque_status = "sem_oferta"
+        estoque_melhor = None
+        if usadas:
+            melhor = by_id[rec] if rec in valid_ids else min(usadas, key=lambda c: c["preco"])
+            eff = effective_available(melhor)
+            estoque_melhor = eff
+            if eff is None:
+                estoque_status = "desconhecido"
+            elif eff >= qtd:
+                estoque_status = "suficiente"
+            else:
+                estoque_status = "insuficiente"
+                if not melhor.get("esgotado"):
+                    avisos.append(
+                        f"Item {num_disp} ({nome_item}): a melhor oferta ({melhor['loja']}) "
+                        f"tem apenas {eff} unidade(s) disponível(is), insuficiente para "
+                        f"as {fmt_qtd(qtd)} solicitadas."
+                    )
+
+            # avisos adicionais para as demais ofertas usadas
+            for c in usadas:
+                if c is melhor:
+                    continue
+                eff_c = effective_available(c)
+                if eff_c is not None and eff_c < qtd and not c.get("esgotado"):
+                    avisos.append(
+                        f"Item {num_disp} ({nome_item}): oferta em {c['loja']} tem apenas "
+                        f"{eff_c} unidade(s), insuficiente para {fmt_qtd(qtd)}."
+                    )
+
+            # aviso de estoque não confirmado (quantidades maiores)
+            if qtd >= 5 and all(effective_available(c) is None for c in usadas):
+                avisos.append(
+                    f"Item {num_disp} ({nome_item}): não foi possível confirmar o estoque "
+                    f"das ofertas; recomenda-se confirmar a disponibilidade para "
+                    f"{fmt_qtd(qtd)} unidade(s)."
+                )
+
+        # ---------- seleção final ----------
         if usadas:
             for c in usadas:
                 c["usada"] = True
@@ -984,15 +1162,21 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
                     break
             precos = [c["preco"] for c in usadas]
             preco, faixa, ref = melhor["preco"], (min(precos), max(precos)), melhor["titulo"]
-            confianca = "baixa (provisória)" if provisorio else ("alta" if len(usadas) >= 2 else "média")
+            if provisorio:
+                confianca = "baixa (provisória)"
+            elif estoque_status == "insuficiente":
+                confianca = "baixa (estoque insuficiente)"
+            elif len(usadas) >= 2:
+                confianca = "alta"
+            else:
+                confianca = "média"
         else:
             preco, faixa, confianca, ref = 0.0, (0.0, 0.0), "sem cotação", ""
             avisos.append(f"Item {num_disp} ({nome_item}): nenhuma oferta encontrada automaticamente.")
 
-        qtd = to_float(it.get("quantidade"), 1.0) or 1.0
         linhas.append({
-            "numero": num_disp,          # exibição (string, ex.: "4")
-            "indice": i,                 # interno (0-based, para mapeamento)
+            "numero": num_disp,
+            "indice": i,
             "nome": nome_item,
             "unidade": str(it.get("unidade") or "un"),
             "quantidade": qtd,
@@ -1016,6 +1200,8 @@ def run_pipeline(llm, edital, empresa, jina_key="", use_jina=True,
             "confianca": confianca,
             "justificativa": str(v.get("justificativa") or ""),
             "requisitos_nao_atendidos": v.get("requisitos_nao_atendidos", []),
+            "estoque_status": estoque_status,
+            "estoque_melhor": estoque_melhor,
         })
 
     tasks = [(l, u) for l in linhas for u in l["imagem_candidatas"]]
@@ -1284,16 +1470,17 @@ def build_pdf(p: dict, anexo: bool = False) -> bytes:
             if not validas:
                 story.append(P("Sem ofertas utilizadas.", small))
                 continue
-            rows = [[P(h, th) for h in ("Loja", "Preço", "Link")]]
+            rows = [[P(h, th) for h in ("Loja", "Preço", "Disponibilidade", "Link")]]
             for q in validas:
                 href = escape(q["url"], {'"': "&quot;"})
-                short = escape(q["url"][:70] + ("…" if len(q["url"]) > 70 else ""))
+                short = escape(q["url"][:60] + ("…" if len(q["url"]) > 60 else ""))
                 rows.append([
                     P(q["loja"], small),
                     P(brl(q["preco"]), small),
+                    P(_fmt_stock_cell(q), small),
                     Paragraph(f'<link href="{href}" color="blue">{short}</link>', small),
                 ])
-            qt = Table(rows, colWidths=[4 * cm, 3 * cm, 10 * cm], repeatRows=1)
+            qt = Table(rows, colWidths=[3.5 * cm, 2.5 * cm, 3.5 * cm, 7.5 * cm], repeatRows=1)
             qt.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), NAVY),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey),
@@ -1449,6 +1636,7 @@ if oa_key and oa_models:
 
 st.title("📄 Gerador de Propostas para Licitações")
 st.caption("Cole a especificação do edital: os agentes pesquisam preços reais na web e geram a proposta em PDF.")
+st.caption("💡 O app tenta verificar o estoque de cada oferta quando o site o declara; caso contrário, sinaliza como 'não verificado'.")
 
 edital_text = st.text_area(
     "Especificação do produto (texto bruto do edital)", height=260,
@@ -1519,16 +1707,25 @@ if proposta:
                 icon = "❌" if err else "✓"
                 st.caption(f"{icon} `{q}` — {n} resultado(s){' · ' + err if err else ''}")
 
+    stock_map = {
+        "suficiente": "✅ suficiente",
+        "insuficiente": "❌ insuficiente",
+        "desconhecido": "⚠️ não verificado",
+        "sem_oferta": "—",
+    }
     df = pd.DataFrame([
-        {"Item": l["numero"], "Produto": l["nome"], "Un.": l["unidade"], "Qtd": l["quantidade"],
-         "Preço unitário": l["preco_unitario"],
-         "Faixa encontrada": f"{brl(l['faixa'][0])} – {brl(l['faixa'][1])}" if l["faixa"][1] else "—",
-         "Confiança": l["confianca"]}
+        {
+            "Item": l["numero"], "Produto": l["nome"], "Un.": l["unidade"], "Qtd": l["quantidade"],
+            "Preço unitário": l["preco_unitario"],
+            "Faixa encontrada": f"{brl(l['faixa'][0])} – {brl(l['faixa'][1])}" if l["faixa"][1] else "—",
+            "Estoque": stock_map.get(l.get("estoque_status", "desconhecido"), "—"),
+            "Confiança": l["confianca"],
+        }
         for l in proposta["linhas"]
     ])
     edited = st.data_editor(
         df, hide_index=True,
-        disabled=["Item", "Produto", "Un.", "Faixa encontrada", "Confiança"],
+        disabled=["Item", "Produto", "Un.", "Faixa encontrada", "Estoque", "Confiança"],
         key=f"editor_{st.session_state['gen_id']}",
         column_config={
             "Qtd": st.column_config.NumberColumn(min_value=0.0),
@@ -1551,8 +1748,21 @@ if proposta:
             f"Item {l['numero']} — {l['nome']}  ·  ofertas: {len(l['cotacoes'])}  ·  confiança: {l['confianca']}",
             expanded=not l["cotacoes"],
         ):
-            # chave estável baseada no índice interno (não no número exibido)
             gid = f"{st.session_state['gen_id']}_{l['indice']}"
+
+            # ---------- status de estoque (dinâmico, reflete edição de quantidade) ----------
+            qtd_final = l["quantidade"]
+            eff = l.get("estoque_melhor")
+            if l.get("cotacoes"):
+                if eff is None:
+                    st.caption("⚠️ Estoque não declarado pelas ofertas — confirme com o fornecedor.")
+                elif eff >= qtd_final:
+                    st.caption(f"✅ Estoque confirmado na melhor oferta: {eff} unidade(s) disponível(is).")
+                else:
+                    st.warning(
+                        f"⚠️ Estoque insuficiente na melhor oferta: {eff} unidade(s) "
+                        f"para {fmt_qtd(qtd_final)} solicitadas."
+                    )
 
             up = st.file_uploader(
                 "Enviar imagem própria (PNG, JPG, WEBP)",
@@ -1604,6 +1814,7 @@ if proposta:
                             "Produto": q["titulo"],
                             "Preço": q["preco"],
                             "Esgotado": "Sim" if q.get("esgotado") else "Não",
+                            "Disponibilidade": _fmt_stock_cell(q),
                             "Link": q["url"],
                         }
                         for q in l["cotacoes"]
